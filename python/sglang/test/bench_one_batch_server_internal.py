@@ -497,6 +497,7 @@ def run_one_case(
     print(f"input throughput: {input_throughput:.2f} tok/s")
     if output_len != 1:
         print(f"output throughput: {output_throughput:.2f} tok/s")
+        print(f"tpot: {batch_size * 1000 / output_throughput:.2f} ms")
     print(f"last_ttft: {last_ttft:.2f} s")
     print(f"last generation throughput: {last_gen_throughput:.2f} tok/s")
     if acc_length > 0:
@@ -662,7 +663,7 @@ def run_benchmark_internal(
     max_running_requests_per_dp = internal_state[0].get(
         "effective_max_running_requests_per_dp", -1
     )
-    dp_size = server_info.get("dp_size", None) or 1
+    dp_size = internal_state[0].get("dp_size", None) or 1
     assert (
         max_running_requests_per_dp > 0
     ), f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
