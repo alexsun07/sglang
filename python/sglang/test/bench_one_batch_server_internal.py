@@ -532,13 +532,13 @@ def run_one_case(
 def should_skip_due_to_token_capacity(
     batch_size, input_len, output_len, skip_token_capacity_threshold
 ):
-    if batch_size * (input_len + output_len) > skip_token_capacity_threshold:
-        print(
-            "=" * 8
-            + f"Skip benchmark {batch_size=} * ({input_len=} + {output_len=}) = {batch_size * (input_len + output_len)} > {skip_token_capacity_threshold=} due to kv cache limit."
-            + "=" * 8
-        )
-        return True
+    # if batch_size * (input_len + output_len) > skip_token_capacity_threshold:
+    #     print(
+    #         "=" * 8
+    #         + f"Skip benchmark {batch_size=} * ({input_len=} + {output_len=}) = {batch_size * (input_len + output_len)} > {skip_token_capacity_threshold=} due to kv cache limit."
+    #         + "=" * 8
+    #     )
+    #     return True
     return False
 
 
