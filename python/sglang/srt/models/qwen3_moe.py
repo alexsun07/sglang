@@ -254,7 +254,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("gate", prefix),
         )
 
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
@@ -272,6 +272,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         if (
             not get_moe_a2a_backend().is_deepep()
+            and not get_moe_a2a_backend().is_mori()
             and not get_moe_a2a_backend().is_ascend_fuseep()
         ):
             return self.forward_normal(
