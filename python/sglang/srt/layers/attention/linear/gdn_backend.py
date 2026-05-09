@@ -506,10 +506,26 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     # CP-aware prefill for the GDN linear-attention path.
     #
-    # mixed_qkv arrives full-T (the model layer does not pre-split it; the
-    # MoE / aiter full-attn layers in this hybrid model are not CP-aware,
-    # so all non-GDN layers must keep operating on full sequences). The
-    # algorithm is zigzag two-pass + (b, M) chain reduce:
+    # mixed_qkv arrives full-T because the model layer does NOT call
+    # cp_split_and_rebuild_data; instead it sets a private
+    # `_gdn_cp_metadata` field that only this backend reads. The reasons
+    # for routing CP through a custom field rather than the standard
+    # `attn_cp_metadata`:
+    #
+    #   - aiter full-attn has no CP support, so it must run full-T per
+    #     rank (redundant compute, correct output).
+    #   - Setting `attn_cp_metadata` would activate sglang's standard CP
+    #     wrapper chain on the MoE path (cp_split_and_rebuild_data at
+    #     model entry, moe_cp_all_gather_into_tensor in the layer
+    #     communicator, cp_all_gather_rerange_output before lm_head),
+    #     all of which assume hidden_states have already been split to
+    #     local-T. MoE compute itself is per-token and CP-orthogonal —
+    #     the incompatibility is in the wrapper wiring, not in MoE.
+    #   - This backend therefore receives full-T and is the only place
+    #     that splits internally; everything else keeps working as if
+    #     CP were off.
+    #
+    # Algorithm (zigzag two-pass + (b, M) chain reduce):
     #
     #   Pass 1: each rank runs its 2 owned segments with initial_state=0
     #           and captures (b_seg, M_seg) — the segment's affine output
