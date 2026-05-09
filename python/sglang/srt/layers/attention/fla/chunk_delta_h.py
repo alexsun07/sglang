@@ -279,24 +279,26 @@ def compute_M_total_pytorch_ref(
     M_out: torch.Tensor,    # [N, H, K, K] fp32 — pre-allocated output, filled in place
     chunk_size: int = CHUNK_SIZE,
 ) -> None:
-    """PyTorch reference for the segment-end M_total matrix used by Option-A
-    Context Parallel (zigzag + (b, M) merge) for GDN linear-attention.
+    """Compute the segment-end ``M_total`` matrix used by the (b, M)-merge
+    Context Parallel scheme for GDN linear-attention.
 
-    For each (sequence n, head h), M[n, h] is defined by the affine recurrence
-    over the segment's NT chunks:
+    For each (sequence n, head h), ``M[n, h]`` is defined by the affine
+    recurrence over the segment's NT chunks::
+
         b_h_after = b_h_initial @ M[n, h] + b_seg[n, h]
 
-    Per chunk t (NT chunks total, applied in causal order):
+    Per chunk t (NT chunks total, applied in causal order)::
+
         N_chunk[h, k_in, k_out] = γ^C[h] · I[k_in, k_out]
                                   - Σ_t W[t, h, k_in] · K_arrow[t, h, k_out]
-        where K_arrow[t, h, k] = exp(g_last[h] - g_chunk[t, h]) · K[t, h, k]
-        (γ-to-end factor mirrors fwd_h's b_v scaling at chunk_delta_h.py:185)
 
-    Then M_seg = N_chunk_1 @ N_chunk_2 @ ... @ N_chunk_NT (matrix product).
+    where ``K_arrow[t, h, k] = exp(g_last[h] - g_chunk[t, h]) · K[t, h, k]``;
+    the γ-to-end factor mirrors ``fwd_h``'s ``b_v`` scaling above. Then
+    ``M_seg = N_chunk_1 @ N_chunk_2 @ ... @ N_chunk_NT``.
 
-    NOTE: This is the PoC v0 implementation — pure PyTorch, no fused Triton
-    kernel. v1 will add a fused Triton kernel for perf parity. The semantics
-    here are the source of truth that the future Triton kernel must match.
+    This is a PyTorch reference and the source of truth for the math; a
+    fused Triton kernel can be substituted later for perf without changing
+    the semantics.
     """
     assert k.shape[0] == 1, "varlen path expects B=1"
     assert M_out.dtype == torch.float32, "M_out must be fp32"
@@ -371,7 +373,7 @@ def chunk_gated_delta_rule_fwd_h(
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
-    M_out: Optional[torch.Tensor] = None,   # NEW: out-param for Option-A CP
+    M_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
@@ -426,8 +428,9 @@ def chunk_gated_delta_rule_fwd_h(
         num_stages=2,
     )
 
-    # Option-A CP path: optionally fill the segment-end M matrix.
-    # Default M_out=None ⇒ skipped entirely (zero numeric or perf change).
+    # Optionally fill the segment-end M matrix used by the GDN Context
+    # Parallel (b, M)-merge path. Default M_out=None skips this entirely
+    # (zero numeric or perf impact for non-CP callers).
     if M_out is not None:
         compute_M_total_pytorch_ref(
             k=k, w=w, g_cumsum=g, cu_seqlens=cu_seqlens,

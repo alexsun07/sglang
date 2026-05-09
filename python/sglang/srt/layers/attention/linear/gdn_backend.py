@@ -6,11 +6,7 @@ from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
-from sglang.srt.layers.dp_attention import (
-    attn_cp_all_gather_into_tensor,
-    get_attention_cp_rank,
-    get_attention_cp_size,
-)
+from sglang.srt.layers.dp_attention import attn_cp_all_gather_into_tensor
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     get_linear_attn_decode_backend,
@@ -364,13 +360,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         assert isinstance(mixed_qkv, torch.Tensor)
         seq_len = mixed_qkv.shape[0]
 
-        # === V15 (B3) — CP-aware GDN forward ===
-        # Read custom _gdn_cp_metadata (NOT attn_cp_metadata, which would activate
-        # other downstream CP code paths in the MoE communicator that we can't
-        # satisfy without splitting hidden_states).
-        # Fall through to non-CP path when seq_len doesn't divide evenly (warmup,
-        # short prompts) — CP code path requires seq_len % (2*cp_size) == 0 for
-        # the equal-segment PoC algorithm.
+        # CP-aware prefill path. The model layer sets the private fields
+        # below only when CP is active; we deliberately do not consume the
+        # standard forward_batch.attn_cp_metadata so that other downstream
+        # paths (MoE communicator etc.) keep seeing full-T hidden_states.
+        # The equal-segment zigzag algorithm requires seq_len divisible by
+        # 2 * cp_size with at least one CHUNK_SIZE=64 chunk per segment;
+        # warmup / short prompts fall through to the non-CP path.
         cp_meta = getattr(forward_batch, "_gdn_cp_metadata", None)
         cp_size = getattr(forward_batch, "_gdn_cp_size", 1)
         if (
@@ -378,20 +374,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and cp_size > 1
             and not forward_batch.forward_mode.is_target_verify()
             and seq_len % (2 * cp_size) == 0
-            and seq_len >= 2 * cp_size * 64  # need at least one chunk per segment (CHUNK_SIZE=64)
+            and seq_len >= 2 * cp_size * 64
         ):
-            cp_rank = getattr(forward_batch, "_gdn_cp_rank", get_attention_cp_rank())
-            # one-shot print so we can confirm CP path fired in production
-            if not getattr(self.__class__, "_v15_cp_path_printed", False):
-                print(
-                    f"[V15 CP FIRE] layer={layer.layer_id} seq_len={seq_len} "
-                    f"cp_size={cp_size} cp_rank={cp_rank} "
-                    f"split_list={cp_meta.split_list}",
-                    flush=True,
-                )
-                self.__class__._v15_cp_path_printed = True
             return self._forward_extend_cp(
-                layer, forward_batch, mixed_qkv, a, b, cp_meta, cp_size, cp_rank
+                layer,
+                forward_batch,
+                mixed_qkv,
+                a,
+                b,
+                cp_size,
+                forward_batch._gdn_cp_rank,
             )
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
@@ -510,55 +502,31 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     forward_batch, h, ssm_states, forward_metadata
                 )
 
-        # === V20: dump ssm_state after non-CP prefill (gated by DUMP_SSM=1 env) ===
-        # Captures the kernel's in-place writeback for cp=1 baseline + noise floor.
-        # One-shot per (layer_id, world_rank) per server boot to avoid filesystem spam.
-        import os as _os
-        if _os.getenv("DUMP_SSM") == "1" and forward_batch.forward_mode.is_extend():
-            try:
-                import torch.distributed as _dist
-                _world_rank = _dist.get_rank() if _dist.is_initialized() else 0
-                _seq_len = mixed_qkv.shape[0] if isinstance(mixed_qkv, torch.Tensor) else seq_len
-                _path = (
-                    f"/tmp/v20_ssm_cp1_layer{layer.layer_id}_rank{_world_rank}"
-                    f"_T{_seq_len}.pt"
-                )
-                if not _os.path.exists(_path):
-                    _slot = int(cache_indices[0].item())
-                    torch.save(
-                        ssm_states[_slot].detach().float().cpu(),
-                        _path,
-                    )
-                    if layer.layer_id == 0:
-                        print(
-                            f"[V20 SSM DUMP cp=1] layer={layer.layer_id} slot={_slot} "
-                            f"path={_path}",
-                            flush=True,
-                        )
-            except Exception as _e:
-                print(f"[V20 SSM DUMP cp=1 ERROR] {_e}", flush=True)
         return core_attn_out
 
-    # ===========================================================================
-    # V15 (B3): CP-aware GDN forward.
+    # CP-aware prefill for the GDN linear-attention path.
     #
-    # Contract:
-    #   - mixed_qkv arrives FULL-T (model file did NOT split). This avoids the
-    #     unbounded OOB chain on aiter_backend (which is not CP-aware).
-    #   - cp_meta is set by Qwen3_5ForCausalLM.forward when CP is active.
-    #   - We do real CP work in Pass 1 + (b,M) all-gather + chain reduce + Pass 2,
-    #     mirroring poc-a/cp_gdn_zigzag.py:cp_zigzag_two_pass.
-    #   - Returns FULL-T core_attn_out so downstream layers (full-attn / MLP)
-    #     keep operating on full sequence.
+    # mixed_qkv arrives full-T (the model layer does not pre-split it; the
+    # MoE / aiter full-attn layers in this hybrid model are not CP-aware,
+    # so all non-GDN layers must keep operating on full sequences). The
+    # algorithm is zigzag two-pass + (b, M) chain reduce:
     #
-    # Caveats (B3 v1, prefill-correctness only):
-    #   - conv1d runs on the FULL sequence on every rank (redundant). No conv1d
-    #     boundary error (ranks compute the SAME conv1d).
-    #   - SSM state writeback is SKIPPED. Decode after this prefill is broken;
-    #     prefill-correctness test (V5/V6 hidden-state dump methodology) is
-    #     unaffected.
-    #   - Prefix cache (extend_prefix_lens > 0) not supported. PoC scope.
-    # ===========================================================================
+    #   Pass 1: each rank runs its 2 owned segments with initial_state=0
+    #           and captures (b_seg, M_seg) — the segment's affine output
+    #           on the recurrent state.
+    #   Reduce: all_gather (b, M); each rank deterministically chains the
+    #           per-segment affine maps in fp32 to derive S_init for every
+    #           segment.
+    #   Pass 2: each rank reruns its 2 owned segments with the correct
+    #           S_init and emits the per-segment outputs.
+    #   Gather: all_gather Pass-2 outputs and reorder to causal full-T.
+    #
+    # The decode-after-CP ssm_state writeback is handled at the bottom of
+    # this method; conv_state writeback happens via causal_conv1d_fn which
+    # every rank runs over the full sequence with identical inputs.
+    #
+    # Constraints (see report.md §1.4): prefix=0 only, no cuda graph,
+    # batch=1, attn_tp ∈ {1, 2}.
     def _forward_extend_cp(
         self,
         layer: RadixLinearAttention,
@@ -566,7 +534,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mixed_qkv: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
-        cp_meta,
         cp_size: int,
         cp_rank: int,
     ):
@@ -583,25 +550,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = mamba_cache_params.temporal
         has_initial_states = forward_batch.extend_prefix_lens > 0
 
-        # === V17 DIAG: check if ssm_states[cache_indices[0]] is non-zero for first prefill
-        # If non-zero → cp=1's "initial_state=ssm_states" reads stale data ≠ my zeros.
-        if not getattr(self.__class__, "_v17_ssm_diag_printed", False):
-            try:
-                slot = int(cache_indices[0].item())
-                ssm_slice = ssm_states[slot]
-                print(
-                    f"[V17 SSM DIAG] layer={layer.layer_id} slot={slot} "
-                    f"ssm_states[slot] abs max={ssm_slice.abs().max().item():.3e} "
-                    f"mean abs={ssm_slice.abs().mean().item():.3e} "
-                    f"shape={tuple(ssm_slice.shape)}",
-                    flush=True,
-                )
-                if layer.layer_id >= 5:
-                    self.__class__._v17_ssm_diag_printed = True
-            except Exception as _e:
-                print(f"[V17 SSM DIAG ERROR] {_e}", flush=True)
-
-        # ----- conv1d on FULL mixed_qkv (every rank computes same result) -----
+        # conv1d on the full sequence — every CP rank computes the same result
+        # and writes the same conv_state into its local cache slot.
         mixed_qkv_t = mixed_qkv.transpose(0, 1)
         if forward_metadata.has_mamba_track_mask:
             mixed_qkv_to_track = mixed_qkv_t[
@@ -620,7 +570,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)[:seq_len]
 
-        # ----- Split q/k/v + gating (FULL-T) -----
+        # Split q/k/v and run gating on the full sequence.
         query, key, value = torch.split(
             mixed_qkv,
             [layer.q_dim, layer.k_dim, layer.v_dim],
@@ -636,22 +586,25 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value = value.view(1, seq_len, Hv, Vdim)
         g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
-        # ----- CP segment plan (zigzag) -----
+        # Zigzag segment plan: 2 * cp_size equal segments. Each rank owns
+        # the {rank, num_segs - 1 - rank} pair so rank 0 always owns the
+        # last causal segment (used below for ssm_state writeback).
         num_segs = SEG_PER_RANK * cp_size
         assert seq_len % num_segs == 0, (
-            f"V15 B3 PoC requires seq_len divisible by 2*cp_size; "
+            f"CP requires seq_len divisible by 2*cp_size; "
             f"got seq_len={seq_len} num_segs={num_segs}"
         )
         seg_len = seq_len // num_segs
         cu_seg = torch.tensor([0, seg_len], dtype=torch.int32, device=device)
         state_idx = torch.tensor([0], dtype=torch.int64, device=device)
-        owned = [cp_rank, num_segs - 1 - cp_rank]  # zigzag rule
+        owned = [cp_rank, num_segs - 1 - cp_rank]
 
         def _slice_seg(t, seg_idx):
             s = seg_idx * seg_len
             return t.narrow(1, s, seg_len).contiguous()
 
-        # ----- Pass 1: only owned segments, init=0, capture (b, M) -----
+        # Pass 1: run owned segments with initial_state=0 and capture
+        # (b_seg, M_seg) — the per-segment affine map on the recurrent state.
         b_pair = torch.zeros(
             SEG_PER_RANK, Hv, Vdim, Kdim, dtype=torch.float32, device=device
         )
@@ -685,7 +638,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             b_pair[slot] = state[0]
             M_pair[slot] = M_buf[0]
 
-        # ----- All-gather (b, M) over cp_group (use sglang's GroupCoordinator wrapper) -----
+        # All-gather (b, M) across the CP group so every rank has the full
+        # per-segment affine maps.
         b_gathered = torch.empty(
             num_segs, Hv, Vdim, Kdim, dtype=torch.float32, device=device
         )
@@ -695,7 +649,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         attn_cp_all_gather_into_tensor(b_gathered, b_pair.contiguous())
         attn_cp_all_gather_into_tensor(M_gathered, M_pair.contiguous())
 
-        # ----- Reorder gather → causal index (PoC: causal_to_gather_perm) -----
+        # Reorder gathered tensors from rank-major (rank 0 head, rank 0 tail,
+        # rank 1 head, ...) to causal segment order.
         perm = []
         for i in range(num_segs):
             owner = min(i, num_segs - 1 - i)
@@ -705,27 +660,26 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b_causal = b_gathered[perm_t]
         M_causal = M_gathered[perm_t]
 
-        # ----- fp32 chain reduce (LOCAL): S_init[i+1] = S_init[i] @ M[i] + b[i] -----
+        # Deterministic fp32 chain reduce: S_init[i+1] = S_init[i] @ M[i] + b[i].
+        # Same op order on every rank → bit-identical S_init across ranks.
         S_init = [None] * num_segs
         S_init[0] = torch.zeros(
             1, Hv, Vdim, Kdim, dtype=torch.float32, device=device
         )
         for i in range(1, num_segs):
-            # PoC: torch.einsum("nhvk,hkj->nhvj", S, M) — affine fp32 update.
             S_init[i] = (
                 torch.einsum("nhvk,hkj->nhvj", S_init[i - 1], M_causal[i - 1])
                 + b_causal[i - 1].unsqueeze(0)
             )
 
-        # ----- Pass 2: only owned segments with correct S_init -----
-        # V19.1: capture in-place writeback of S_init_seg after Pass 2 of seg_(N-1)
-        #         (the rank that owns the last causal segment = rank 0 by zigzag rule).
-        #         This is the kernel's true final state for that segment, ensuring
-        #         bit-exact match with cp=1's writeback (which uses the same kernel).
+        # Pass 2: rerun owned segments with the correct S_init. The rank
+        # that owns the last causal segment also captures the kernel's
+        # in-place final-state writeback, which is the authoritative
+        # full-sequence ssm_state used below for decode-after-CP.
         out_pair = torch.empty(
             SEG_PER_RANK, seg_len, Hv, Vdim, dtype=value.dtype, device=device
         )
-        captured_final_state = None  # only rank owning seg_(N-1) sets this
+        captured_final_state = None
         last_seg_idx = num_segs - 1
         for slot, seg_idx in enumerate(owned):
             q_seg = _slice_seg(query, seg_idx)
@@ -747,77 +701,42 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 M_out=None,
             )
             out_pair[slot] = o[0]  # [seg_len, Hv, Vdim]
-            # On the rank owning seg_(N-1), capture the kernel's in-place state writeback.
             if seg_idx == last_seg_idx:
                 captured_final_state = S_init_seg[0].clone().contiguous()
 
-        # ----- All-gather Pass-2 outputs and reorder to causal full-T -----
+        # All-gather Pass-2 outputs and reorder to causal full-T.
         out_gathered = torch.empty(
             num_segs, seg_len, Hv, Vdim, dtype=value.dtype, device=device
         )
         attn_cp_all_gather_into_tensor(out_gathered, out_pair.contiguous())
-        out_causal = out_gathered[perm_t]  # [num_segs, seg_len, Hv, Vdim]
+        out_causal = out_gathered[perm_t]
         core_attn_out = out_causal.reshape(1, num_segs * seg_len, Hv, Vdim)
 
-        # ===========================================================================
-        # V19.1: ssm_state writeback for decode-after-CP-prefill support.
+        # ssm_state writeback for decode-after-CP-prefill.
         #
-        # Mirrors sglang's full-attn pattern (cp_allgather_and_save_kv_cache):
-        # every CP rank ends prefill with the request's full state in its local
-        # pool. Decode then runs through the standard non-CP path (scheduler
-        # clears attn_cp_metadata on extend→decode transition; GDN forward_decode
-        # reads ssm_states[cache_indices[0]] symmetrically per CP rank).
+        # The scheduler clears CP metadata on the extend→decode transition,
+        # so decode runs the standard non-CP path which reads
+        # ssm_states[cache_indices[0]] on each rank. Every CP rank therefore
+        # needs the full-sequence final state in its local cache slot.
         #
-        # The rank owning seg_(N-1) (= rank 0 by zigzag rule, since rank 0 owns
-        # {0, 2*cp_size-1}) ran Pass 2 on that segment and captured the kernel's
-        # in-place final-state writeback into `captured_final_state`. We broadcast
-        # this to all CP ranks and write to local ssm_states[slot]. Using the
-        # kernel's actual writeback (rather than reconstructing via einsum
-        # extension of the chain reduce) ensures bit-exact equivalence with
-        # cp=1's automatic in-place writeback in the non-CP path.
+        # Rank 0 owns the last causal segment (zigzag pairing puts seg_0 and
+        # seg_{num_segs-1} on rank 0) and has already captured the kernel's
+        # in-place final-state writeback for that segment. We all-gather and
+        # use rank 0's slot — using the kernel's actual writeback (rather
+        # than reconstructing it via the affine chain) keeps the non-CP and
+        # CP paths bit-identical for decode.
         #
-        # Conv_state writeback: already handled by causal_conv1d_fn above (every
-        # CP rank runs full-T conv1d on identical inputs → identical writes,
-        # idempotent across ranks).
-        # ===========================================================================
+        # conv_state writeback is already done by causal_conv1d_fn above:
+        # every rank ran full-T conv1d on identical inputs, so the per-rank
+        # writes are idempotent.
         if captured_final_state is None:
-            # ranks not owning seg_(N-1) allocate buffer to receive broadcast
             captured_final_state = torch.empty(
                 Hv, Vdim, Kdim, dtype=torch.float32, device=device
             )
-        # Broadcast from the rank that captured (= rank 0 in the cp group).
-        # attn_cp_all_gather_into_tensor with output sized cp_size × input gives
-        # us all ranks' values; rank 0's slot is at offset 0. Each rank then
-        # uses gathered[0] as the authoritative S_final.
         gathered_states = torch.empty(
             cp_size, Hv, Vdim, Kdim, dtype=torch.float32, device=device
         )
         attn_cp_all_gather_into_tensor(gathered_states, captured_final_state)
-        S_final = gathered_states[0]  # rank 0 owns seg_(N-1) → its captured state is the truth
-        ssm_states[cache_indices[0]] = S_final.to(ssm_states.dtype)
+        ssm_states[cache_indices[0]] = gathered_states[0].to(ssm_states.dtype)
 
-        # === V20: dump ssm_state after V19.1 CP writeback (gated by DUMP_SSM=1) ===
-        import os as _os
-        if _os.getenv("DUMP_SSM") == "1":
-            try:
-                import torch.distributed as _dist
-                _world_rank = _dist.get_rank() if _dist.is_initialized() else 0
-                _path = (
-                    f"/tmp/v20_ssm_cp{cp_size}_layer{layer.layer_id}"
-                    f"_rank{_world_rank}_T{seq_len}.pt"
-                )
-                if not _os.path.exists(_path):
-                    _slot = int(cache_indices[0].item())
-                    torch.save(
-                        ssm_states[_slot].detach().float().cpu(),
-                        _path,
-                    )
-                    if layer.layer_id == 0:
-                        print(
-                            f"[V20 SSM DUMP cp={cp_size}] layer={layer.layer_id} "
-                            f"slot={_slot} path={_path}",
-                            flush=True,
-                        )
-            except Exception as _e:
-                print(f"[V20 SSM DUMP cp ERROR] {_e}", flush=True)
         return core_attn_out
