@@ -50,13 +50,21 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 
-# Context Parallel for the GDN linear-attention path. Only the GDN backend
-# consumes this metadata; the standard attn_cp_metadata is intentionally left
-# unset (see Qwen3_5ForCausalLM.forward).
+# Standard zigzag CP wiring (post alex/zigzag-cp aiter+CP support):
+# split hidden_states at model entry, run all layers on local-T per rank,
+# gather at model exit. GDN backend internally re-splits owned segments
+# from the local-T input; full-attn (aiter) handles its own split via
+# cp_attn_forward_extend / cp_allgather_and_save_kv_cache.
 from sglang.srt.layers.utils.cp_utils import (
     can_cp_split,
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
     is_prefill_context_parallel_enabled,
     prepare_context_parallel_metadata,
+)
+from sglang.srt.distributed.parallel_state import (
+    get_moe_tensor_parallel_world_size,
 )
 
 # Layers - Others
@@ -1070,6 +1078,24 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         self.layers_to_capture = []
 
+        # Standard zigzag CP attributes (mirror qwen3_moe.py:976-981).
+        # Used by cp_all_gather_rerange_output at model exit.
+        self.attn_cp_size = get_attention_cp_size()
+        self.attn_cp_rank = get_attention_cp_rank()
+
+        # Defensive MoE constraint enforcement (per bef256b63 commit message
+        # documenting upstream MoE-TP/CP interaction). Without this assert,
+        # silent garbage output if launched with moe_tp_size > 1 + CP enabled.
+        if self.attn_cp_size > 1:
+            moe_tp = get_moe_tensor_parallel_world_size()
+            assert moe_tp == 1, (
+                f"Qwen3.5 + prefill CP requires moe_tp_size == 1 "
+                f"(upstream MoE-TP/CP interaction; see bef256b63 commit "
+                f"message). Got moe_tp_size={moe_tp}. Set --moe-dp-size and "
+                f"--ep-size so tp_size / (moe_dp_size * ep_size) == 1. "
+                f"Recommended: tp=4 cp=2 → --moe-dp-size 2 --ep-size 2."
+            )
+
     def get_input_embeddings(self):
         return self.embed_tokens
 
@@ -1096,20 +1122,14 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        # CP wiring for the GDN backend only.
-        #
-        # We deliberately do NOT set forward_batch.attn_cp_metadata. The standard
-        # field activates downstream paths (MoE communicator, KV cache writeback,
-        # lm_head gather) that assume hidden_states has been split to local-T,
-        # which is incompatible with the AMD aiter full-attn backend (no CP
-        # support) used for the non-GDN layers in this hybrid model.
-        #
-        # Instead we attach private fields read only by GDNAttnBackend; every
-        # other layer sees attn_cp_metadata is None and runs full-T redundantly
-        # per CP rank. The GDN backend internally splits, runs the zigzag
-        # two-pass + (b, M) chain reduce, and returns full-T output.
+        # Standard zigzag CP wiring (post alex/zigzag-cp aiter+CP support).
+        # Sets standard forward_batch.attn_cp_metadata which activates:
+        #   - aiter_backend: cp_attn_forward_extend + cp_allgather_and_save_kv_cache
+        #   - GDN backend: internal owned-segment split (input is local-T per rank)
+        #   - cp_split_and_rebuild_data after embed → local-T per rank for all layers
+        #   - cp_all_gather_rerange_output before return → full-T for lm_head
         if is_prefill_context_parallel_enabled():
-            cp_size = get_attention_cp_size()
+            cp_size = self.attn_cp_size
             # input_ids is None when this forward is invoked from
             # general_mm_embed_routine; fall back to input_embeds in that case.
             if input_ids is not None:
@@ -1123,14 +1143,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                 and seq_len_for_cp is not None
                 and can_cp_split(seq_len_for_cp, cp_size, forward_batch)
             ):
-                forward_batch._gdn_cp_metadata = prepare_context_parallel_metadata(
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     seq_len_for_cp,
-                    get_attention_cp_rank(),
+                    self.attn_cp_rank,
                     cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
-                forward_batch._gdn_cp_size = cp_size
-                forward_batch._gdn_cp_rank = get_attention_cp_rank()
 
         # Initialize hidden states
         if self.pp_group.is_first_rank:
@@ -1143,6 +1161,18 @@ class Qwen3_5ForCausalLM(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+
+        # Split hidden_states + positions to local-T per rank (zigzag layout:
+        # rank r owns 2 segments, concatenated as [seg_r, seg_(2cp-1-r)]).
+        # All subsequent layers operate on local-T per rank.
+        if (
+            is_prefill_context_parallel_enabled()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            if self.pp_group.is_first_rank:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
 
         aux_hidden_states = []
         # Pass through decoder layers
@@ -1189,6 +1219,21 @@ class Qwen3_5ForCausalLM(nn.Module):
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
+
+        # Gather local-T per rank back to full-T in causal order before lm_head.
+        # Mirror qwen2_moe.py:826-836 / qwen3_moe.py exit pattern.
+        if (
+            self.pp_group.is_last_rank
+            and is_prefill_context_parallel_enabled()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            hidden_states = cp_all_gather_rerange_output(
+                hidden_states,
+                self.attn_cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
 
         if len(aux_hidden_states) == 0:
             return hidden_states

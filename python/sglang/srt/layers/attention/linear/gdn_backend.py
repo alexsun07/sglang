@@ -1,12 +1,17 @@
 from typing import Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
-from sglang.srt.layers.dp_attention import attn_cp_all_gather_into_tensor
+from sglang.srt.layers.dp_attention import (
+    attn_cp_all_gather_into_tensor,
+    get_attention_cp_group,
+    get_attention_cp_rank,
+)
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     get_linear_attn_decode_backend,
@@ -261,6 +266,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
 
+        # CP attributes (mirror FA backend / aiter backend pattern).
+        # Used by _forward_extend_cp dispatch and conv1d D1a boundary exchange.
+        self.attn_cp_size = getattr(model_runner, "attn_cp_size", 1)
+        self.attn_cp_rank = (
+            get_attention_cp_rank() if self.attn_cp_size > 1 else 0
+        )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
@@ -360,21 +372,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
         assert isinstance(mixed_qkv, torch.Tensor)
         seq_len = mixed_qkv.shape[0]
 
-        # CP-aware prefill path. The model layer sets the private fields
-        # below only when CP is active; we deliberately do not consume the
-        # standard forward_batch.attn_cp_metadata so that other downstream
-        # paths (MoE communicator etc.) keep seeing full-T hidden_states.
-        # The equal-segment zigzag algorithm requires seq_len divisible by
-        # 2 * cp_size with at least one CHUNK_SIZE=64 chunk per segment;
-        # warmup / short prompts fall through to the non-CP path.
-        cp_meta = getattr(forward_batch, "_gdn_cp_metadata", None)
-        cp_size = getattr(forward_batch, "_gdn_cp_size", 1)
+        # CP-aware prefill path. Activated when the model layer set
+        # forward_batch.attn_cp_metadata via cp_split_and_rebuild_data, so
+        # mixed_qkv arrives ALREADY local-T per rank (= rank's 2 owned
+        # zigzag segments concatenated). The full-sequence equal-segment
+        # algorithm requires the FULL kv_len divisible by 2*cp_size with
+        # at least one CHUNK_SIZE=64 chunk per segment; this is gated
+        # upstream via can_cp_split() inside the model. Warmup / short
+        # prompts have attn_cp_metadata == None and fall through here.
+        cp_meta = getattr(forward_batch, "attn_cp_metadata", None)
+        cp_size = self.attn_cp_size
         if (
             cp_meta is not None
             and cp_size > 1
             and not forward_batch.forward_mode.is_target_verify()
-            and seq_len % (2 * cp_size) == 0
-            and seq_len >= 2 * cp_size * 64
+            and forward_batch.forward_mode.is_context_parallel_extend()
         ):
             return self._forward_extend_cp(
                 layer,
@@ -383,7 +395,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 a,
                 b,
                 cp_size,
-                forward_batch._gdn_cp_rank,
+                self.attn_cp_rank,
             )
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
@@ -506,27 +518,26 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     # CP-aware prefill for the GDN linear-attention path.
     #
-    # mixed_qkv arrives full-T because the model layer does NOT call
-    # cp_split_and_rebuild_data; instead it sets a private
-    # `_gdn_cp_metadata` field that only this backend reads. The reasons
-    # for routing CP through a custom field rather than the standard
-    # `attn_cp_metadata`:
-    #
-    #   - aiter full-attn has no CP support, so it must run full-T per
-    #     rank (redundant compute, correct output).
-    #   - Setting `attn_cp_metadata` would activate sglang's standard CP
-    #     wrapper chain on the MoE path (cp_split_and_rebuild_data at
-    #     model entry, moe_cp_all_gather_into_tensor in the layer
-    #     communicator, cp_all_gather_rerange_output before lm_head),
-    #     all of which assume hidden_states have already been split to
-    #     local-T. MoE compute itself is per-token and CP-orthogonal —
-    #     the incompatibility is in the wrapper wiring, not in MoE.
-    #   - This backend therefore receives full-T and is the only place
-    #     that splits internally; everything else keeps working as if
-    #     CP were off.
+    # mixed_qkv arrives LOCAL-T per rank because the model layer (in
+    # qwen3_5.py post-zigzag-cp) calls cp_split_and_rebuild_data after
+    # embed; subsequent layers (in_proj, conv1d, GDN body, etc.) all
+    # operate on local-T per rank. This backend's contract:
+    #   - input: mixed_qkv shape [seg_a_len + seg_b_len, q_dim+k_dim+v_dim]
+    #     where seg_a = rank's first owned segment (= seg_(cp_rank)),
+    #           seg_b = rank's second owned segment (= seg_(2cp-1-cp_rank))
+    #     in causal order: seg_a is earlier in the full sequence.
+    #   - output: same local-T layout (the model's exit
+    #     cp_all_gather_rerange_output gathers + reorders to full-T
+    #     before lm_head).
     #
     # Algorithm (zigzag two-pass + (b, M) chain reduce):
     #
+    #   conv1d: D1a boundary exchange — each rank exchanges (K-1) tokens
+    #           with adjacent ranks for left-context, then runs F.conv1d
+    #           on each owned segment locally. Sequence stays sharded;
+    #           only K-1 = 3 tokens × hidden cross the wire per layer.
+    #           Middle rank (cp_size-1)'s seg_b feed comes intra-rank
+    #           from its own seg_a tail — no P2P for that pair.
     #   Pass 1: each rank runs its 2 owned segments with initial_state=0
     #           and captures (b_seg, M_seg) — the segment's affine output
     #           on the recurrent state.
@@ -535,11 +546,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
     #           segment.
     #   Pass 2: each rank reruns its 2 owned segments with the correct
     #           S_init and emits the per-segment outputs.
-    #   Gather: all_gather Pass-2 outputs and reorder to causal full-T.
+    #   Output: simple concat([seg_a_out, seg_b_out]) → return local-T.
+    #           No outer all_gather (model layer's exit handles that).
     #
-    # The decode-after-CP ssm_state writeback is handled at the bottom of
-    # this method; conv_state writeback happens via causal_conv1d_fn which
-    # every rank runs over the full sequence with identical inputs.
+    # ssm_state writeback (decode-after-CP): rank 0 owns seg_(2cp-1) (the
+    # last causal segment) and captures the Pass 2 final state, then
+    # all_gather + use slot 0 → all ranks write same state to local cache.
+    #
+    # conv_state writeback: rank 0's seg_b INPUT tail (last K-1 tokens of
+    # mixed_qkv before conv) is the full-sequence conv_state. Rank 0
+    # broadcasts via cp_group; all ranks write same conv_state to local
+    # cache slot.
     #
     # Constraints (see report.md §1.4): prefix=0 only, no cuda graph,
     # batch=1, attn_tp ∈ {1, 2}.
@@ -554,39 +571,185 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cp_rank: int,
     ):
         SEG_PER_RANK = 2  # zigzag invariant: each rank holds {head, tail} pair
-        seq_len = mixed_qkv.shape[0]
+        cp_meta = forward_batch.attn_cp_metadata
         device = mixed_qkv.device
+        dtype = mixed_qkv.dtype
+        dim = mixed_qkv.shape[-1]
 
-        forward_metadata = self.forward_metadata
-        query_start_loc = forward_metadata.query_start_loc
-        cache_indices = forward_metadata.mamba_cache_indices
+        # Owned segment lengths from standard cp metadata (split_list is the
+        # 2*cp_size segment lengths in causal order; remainder distributed
+        # to the first segments — seg_a / seg_b can differ by 1 in pathological
+        # cases, hence torch.split with explicit lengths instead of chunk(2)).
+        num_segs = SEG_PER_RANK * cp_size
+        seg_a_len = cp_meta.split_list[cp_rank]                  # = seg_(cp_rank)
+        seg_b_len = cp_meta.split_list[num_segs - 1 - cp_rank]   # = seg_(2cp-1-cp_rank)
+        local_T = seg_a_len + seg_b_len
+        assert mixed_qkv.shape[0] == local_T, (
+            f"GDN backend CP path expects local-T input (= seg_a + seg_b = "
+            f"{seg_a_len} + {seg_b_len}), got mixed_qkv.shape[0]={mixed_qkv.shape[0]}"
+        )
 
+        # === D1a: conv1d via boundary exchange ===
+        # K = conv kernel size. Stored on conv_weights as last dim.
+        # conv_weights shape per causal_conv1d_fn docstring: (dim, K).
+        K = layer.conv_weights.shape[-1]
+        Kp = K - 1  # left-context size needed for causal conv1d
+
+        # Pre-compute own segment tails (last Kp tokens of each owned seg's
+        # INPUT mixed_qkv). If a segment is shorter than Kp, left-pad with
+        # zeros (matches conv1d causal-pad semantics for very short segs;
+        # in practice seg_len >> K=4 since CP is gated by seq_len >= 2cp*64).
+        def _tail(seg_input):
+            if seg_input.shape[0] >= Kp:
+                return seg_input[-Kp:].contiguous()
+            pad = torch.zeros(
+                Kp - seg_input.shape[0], dim, dtype=dtype, device=device
+            )
+            return torch.cat([pad, seg_input], dim=0).contiguous()
+
+        seg_a_input = mixed_qkv[:seg_a_len]
+        seg_b_input = mixed_qkv[seg_a_len:]
+        own_seg_a_tail = _tail(seg_a_input)
+        own_seg_b_tail = _tail(seg_b_input)
+
+        # === D1a forensic probe (reviewer instrumentation ask 1) ===
+        # First-forward only, per backend instance: confirms layer.activation
+        # matches our F.silu assumption + records cp/seg dims for postmortem
+        # if numerical drift shows up.
+        if not getattr(self, "_d1a_logged", False):
+            print(
+                f"[D1a] activation={layer.activation!r} K={K} dim={dim} "
+                f"cp_rank={cp_rank} cp_size={cp_size} "
+                f"seg_a_len={seg_a_len} seg_b_len={seg_b_len} local_T={local_T}",
+                flush=True,
+            )
+            self._d1a_logged = True
+
+        # === Boundary exchange via single all_gather ===
+        # Original D1a design used 4× cp_group.send/recv (Ring A + Ring B).
+        # Empirically (Stage 2 boot) NCCL warns:
+        #   "An unbatched P2P op (send/recv) was called on this ProcessGroup
+        #    with size 2. In lazy initialization mode, this will result in
+        #    a new 2-rank NCCL communicator to be created."
+        # With 45 GDN layers × 4 P2P ops each, this creates many tiny
+        # sub-communicators on the hot path → server hangs at warmup.
+        #
+        # Refactor: pack (seg_a_tail, seg_b_tail) per rank, all_gather across
+        # cp_group (collective op, no lazy sub-comm creation), then locally
+        # pick the correct left-feeds based on rank-counting logic. Total
+        # collective volume per layer per rank = cp_size × 2 × Kp × dim ≈
+        # cp_size × 48KB at qwen3.5 dims; still trivial vs the (b,M)
+        # all_gathers already on this path.
+        #
+        # Causal ownership recap:
+        #   rank r owns seg_a = seg_(r) and seg_b = seg_(2cp-1-r).
+        #   seg_a's prev (in causal order) = seg_(r-1), owned by rank (r-1)
+        #     as ITS seg_a (slot 0). For r=0, no prev → zeros.
+        #   seg_b's prev = seg_(2cp-2-r), owned by:
+        #     - if 2cp-2-r < cp_size: rank (2cp-2-r) as its seg_a (slot 0)
+        #       — happens when r >= cp_size-1, i.e., for the middle rank
+        #       cp_size-1 (where 2cp-2-r = cp_size-1 = own rank's seg_a).
+        #     - else: rank (r+1) as ITS seg_b (slot 1).
+        cp_group = get_attention_cp_group()
+        zeros_tail = torch.zeros(Kp, dim, dtype=dtype, device=device)
+
+        # Pack [seg_a_tail, seg_b_tail] per rank → shape [2, Kp, dim]
+        local_tails = torch.stack([own_seg_a_tail, own_seg_b_tail], dim=0)
+        # Gathered shape: [cp_size, 2, Kp, dim]
+        all_tails = torch.empty(
+            cp_size, 2, Kp, dim, dtype=dtype, device=device
+        )
+        attn_cp_all_gather_into_tensor(all_tails, local_tails.contiguous())
+
+        # Pick left-feed for seg_a (= seg_(cp_rank))
+        if cp_rank == 0:
+            seg_a_left = zeros_tail
+        else:
+            # prev = seg_(cp_rank-1) = rank (cp_rank-1)'s seg_a (slot 0)
+            seg_a_left = all_tails[cp_rank - 1, 0]
+
+        # Pick left-feed for seg_b (= seg_(2cp-1-cp_rank))
+        # prev = seg_(2cp-2-cp_rank)
+        prev_b_idx = 2 * cp_size - 2 - cp_rank
+        if prev_b_idx < cp_size:
+            # First-half segment, owned by rank (prev_b_idx) as its seg_a.
+            # When prev_b_idx == cp_rank (middle rank case): intra-rank.
+            seg_b_left = all_tails[prev_b_idx, 0]
+        else:
+            # Second-half segment, owned by rank (cp_rank+1) as its seg_b.
+            seg_b_left = all_tails[cp_rank + 1, 1]
+
+        # === Per-segment causal conv1d via F.conv1d (depthwise) ===
+        # conv_weights stored as (dim, K) per kernel docstring; depthwise
+        # conv1d expects weight shape (out_channels, in_channels/groups, K)
+        # with groups=channels → reshape to (dim, 1, K).
+        # IMPORTANT: pytorch F.conv1d does cross-correlation (no flip),
+        # while causal_conv1d_fn (mamba kernel) is true convolution (kernel
+        # flipped). Empirically test both via env var if drift suspected.
+        # Default: assume causal_conv1d_fn semantics → flip kernel for F.conv1d.
+        # Set CP_CONV_NO_FLIP=1 to disable the flip (debug option).
+        conv_w_raw = layer.conv_weights.unsqueeze(1)  # [dim, 1, K]
+        import os as _os
+        _flip = _os.environ.get("CP_CONV_NO_FLIP", "0") != "1"
+        conv_w = conv_w_raw.flip(-1) if _flip else conv_w_raw
+        conv_b = layer.bias  # [dim] or None
+
+        def _causal_conv1d_local(seg_input, left_context):
+            """seg_input [T, C], left_context [Kp, C]. Returns [T, C] post-act."""
+            x = torch.cat([left_context, seg_input], dim=0)  # [T+Kp, C]
+            # F.conv1d expects (N, C, L) with depthwise weight (C, 1, K).
+            x_t = x.transpose(0, 1).unsqueeze(0)  # [1, C, T+Kp]
+            y = F.conv1d(x_t, conv_w, bias=conv_b, padding=0, groups=conv_w.shape[0])
+            # y shape: [1, C, T+Kp - K + 1] = [1, C, T]
+            y = y.squeeze(0).transpose(0, 1)  # [T, C]
+            # Activation (mamba/qwen3.5 conv uses silu/swish; both equivalent)
+            if layer.activation in ("silu", "swish"):
+                y = F.silu(y)
+            elif layer.activation in (None, "identity"):
+                pass
+            else:
+                raise NotImplementedError(
+                    f"GDN CP conv1d activation {layer.activation!r} not handled"
+                )
+            return y
+
+        seg_a_conv = _causal_conv1d_local(seg_a_input, seg_a_left)  # [seg_a_len, dim]
+        seg_b_conv = _causal_conv1d_local(seg_b_input, seg_b_left)  # [seg_b_len, dim]
+        mixed_qkv = torch.cat([seg_a_conv, seg_b_conv], dim=0)  # [local_T, dim]
+
+        # === conv_state writeback ===
+        # Full-sequence conv_state = last Kp INPUT tokens of seg_(2cp-1).
+        # Rank 0 owns seg_(2cp-1) as its seg_b → own_seg_b_tail (already
+        # computed above) is the right tensor on rank 0.
+        # Use all_gather (same pattern as ssm_state writeback below) instead
+        # of broadcast — pynccl broadcast vs subsequent torch ops on default
+        # stream can race; all_gather via the same `attn_cp_all_gather_into_tensor`
+        # path that the (b,M) gather uses is empirically correctly ordered.
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
-        has_initial_states = forward_batch.extend_prefix_lens > 0
+        cache_indices = self.forward_metadata.mamba_cache_indices
 
-        # conv1d on the full sequence — every CP rank computes the same result
-        # and writes the same conv_state into its local cache slot.
-        mixed_qkv_t = mixed_qkv.transpose(0, 1)
-        if forward_metadata.has_mamba_track_mask:
-            mixed_qkv_to_track = mixed_qkv_t[
-                :, forward_metadata.track_conv_indices
-            ].transpose(0, 1)
-            conv_states[forward_metadata.conv_states_mask_indices] = mixed_qkv_to_track
-        mixed_qkv = causal_conv1d_fn(
-            mixed_qkv_t,
-            layer.conv_weights,
-            layer.bias,
-            activation=layer.activation,
-            conv_states=conv_states,
-            has_initial_state=has_initial_states,
-            cache_indices=cache_indices,
-            query_start_loc=query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)[:seq_len]
+        # Gather all ranks' seg_b tails; pick rank 0's slot.
+        all_seg_b_tails = torch.empty(
+            cp_size, Kp, dim, dtype=dtype, device=device
+        )
+        attn_cp_all_gather_into_tensor(all_seg_b_tails, own_seg_b_tail.contiguous())
+        conv_state_buf = all_seg_b_tails[0]  # rank 0's seg_b tail = full-seq conv state
+        # === conv_states cache layout assert (reviewer instrumentation ask 2) ===
+        _expected_slot_shape = (dim, Kp)
+        _actual_slot_shape = tuple(conv_states[cache_indices[0]].shape)
+        assert _actual_slot_shape == _expected_slot_shape, (
+            f"GDN CP D1a conv_state writeback layout mismatch: expected "
+            f"{_expected_slot_shape} (dim, K-1), got {_actual_slot_shape}. "
+            f"conv_states.shape={tuple(conv_states.shape)}, "
+            f"cache_indices[0]={cache_indices[0].item()}"
+        )
+        conv_states[cache_indices[0]] = conv_state_buf.transpose(0, 1).to(
+            conv_states.dtype
+        )
 
-        # Split q/k/v and run gating on the full sequence.
+        # === Split q/k/v + gating on local-T ===
         query, key, value = torch.split(
             mixed_qkv,
             [layer.q_dim, layer.k_dim, layer.v_dim],
@@ -597,42 +760,40 @@ class GDNAttnBackend(MambaAttnBackendBase):
         Hv = layer.num_v_heads
         Kdim = layer.head_k_dim
         Vdim = layer.head_v_dim
-        query = query.view(1, seq_len, Hq, layer.head_q_dim)
-        key = key.view(1, seq_len, Hk, Kdim)
-        value = value.view(1, seq_len, Hv, Vdim)
+        # Reshape: [local_T, H*D] → [1, local_T, H, D] (kernel expects batch dim)
+        query = query.view(1, local_T, Hq, layer.head_q_dim)
+        key = key.view(1, local_T, Hk, Kdim)
+        value = value.view(1, local_T, Hv, Vdim)
         g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
-        # Zigzag segment plan: 2 * cp_size equal segments. Each rank owns
-        # the {rank, num_segs - 1 - rank} pair so rank 0 always owns the
-        # last causal segment (used below for ssm_state writeback).
-        num_segs = SEG_PER_RANK * cp_size
-        assert seq_len % num_segs == 0, (
-            f"CP requires seq_len divisible by 2*cp_size; "
-            f"got seq_len={seq_len} num_segs={num_segs}"
-        )
-        seg_len = seq_len // num_segs
-        cu_seg = torch.tensor([0, seg_len], dtype=torch.int32, device=device)
+        # === Slice into 2 owned segments (already in (prev,next) layout) ===
         state_idx = torch.tensor([0], dtype=torch.int64, device=device)
-        owned = [cp_rank, num_segs - 1 - cp_rank]
+        # slice fn: returns [1, seg_len, H, D] for kernel input
+        def _slice_local(t, start, length):
+            return t.narrow(1, start, length).contiguous()
 
-        def _slice_seg(t, seg_idx):
-            s = seg_idx * seg_len
-            return t.narrow(1, s, seg_len).contiguous()
+        # owned[slot=0] = seg_a (= seg_cp_rank, length seg_a_len, starts at 0)
+        # owned[slot=1] = seg_b (= seg_(2cp-1-cp_rank), length seg_b_len, starts at seg_a_len)
+        owned_starts = [0, seg_a_len]
+        owned_lens = [seg_a_len, seg_b_len]
+        owned_seg_idx = [cp_rank, num_segs - 1 - cp_rank]
 
-        # Pass 1: run owned segments with initial_state=0 and capture
-        # (b_seg, M_seg) — the per-segment affine map on the recurrent state.
+        # === Pass 1: capture (b_seg, M_seg) per owned segment ===
         b_pair = torch.zeros(
             SEG_PER_RANK, Hv, Vdim, Kdim, dtype=torch.float32, device=device
         )
         M_pair = torch.zeros(
             SEG_PER_RANK, Hv, Kdim, Kdim, dtype=torch.float32, device=device
         )
-        for slot, seg_idx in enumerate(owned):
-            q_seg = _slice_seg(query, seg_idx)
-            k_seg = _slice_seg(key, seg_idx)
-            v_seg = _slice_seg(value, seg_idx)
-            g_seg = _slice_seg(g, seg_idx)
-            beta_seg = _slice_seg(beta, seg_idx)
+        for slot in range(SEG_PER_RANK):
+            seg_len = owned_lens[slot]
+            start = owned_starts[slot]
+            cu_seg = torch.tensor([0, seg_len], dtype=torch.int32, device=device)
+            q_seg = _slice_local(query, start, seg_len)
+            k_seg = _slice_local(key, start, seg_len)
+            v_seg = _slice_local(value, start, seg_len)
+            g_seg = _slice_local(g, start, seg_len)
+            beta_seg = _slice_local(beta, start, seg_len)
             state = torch.zeros(
                 1, Hv, Vdim, Kdim, dtype=torch.float32, device=device
             )
@@ -654,8 +815,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             b_pair[slot] = state[0]
             M_pair[slot] = M_buf[0]
 
-        # All-gather (b, M) across the CP group so every rank has the full
-        # per-segment affine maps.
+        # === All-gather (b, M) across cp_group ===
         b_gathered = torch.empty(
             num_segs, Hv, Vdim, Kdim, dtype=torch.float32, device=device
         )
@@ -665,8 +825,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         attn_cp_all_gather_into_tensor(b_gathered, b_pair.contiguous())
         attn_cp_all_gather_into_tensor(M_gathered, M_pair.contiguous())
 
-        # Reorder gathered tensors from rank-major (rank 0 head, rank 0 tail,
-        # rank 1 head, ...) to causal segment order.
+        # Reorder rank-major (rank 0 head, rank 0 tail, rank 1 head, ...)
+        # to causal segment order. Identical perm logic to old design.
         perm = []
         for i in range(num_segs):
             owner = min(i, num_segs - 1 - i)
@@ -676,8 +836,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b_causal = b_gathered[perm_t]
         M_causal = M_gathered[perm_t]
 
-        # Deterministic fp32 chain reduce: S_init[i+1] = S_init[i] @ M[i] + b[i].
-        # Same op order on every rank → bit-identical S_init across ranks.
+        # === fp32 deterministic chain reduce ===
         S_init = [None] * num_segs
         S_init[0] = torch.zeros(
             1, Hv, Vdim, Kdim, dtype=torch.float32, device=device
@@ -688,21 +847,28 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 + b_causal[i - 1].unsqueeze(0)
             )
 
-        # Pass 2: rerun owned segments with the correct S_init. The rank
-        # that owns the last causal segment also captures the kernel's
-        # in-place final-state writeback, which is the authoritative
-        # full-sequence ssm_state used below for decode-after-CP.
-        out_pair = torch.empty(
-            SEG_PER_RANK, seg_len, Hv, Vdim, dtype=value.dtype, device=device
+        # === Pass 2: rerun owned segments with correct S_init ===
+        # Output buffer: 2 contiguous segments concatenated in (prev,next) layout
+        # to match local-T input ordering.
+        seg_a_out = torch.empty(
+            seg_a_len, Hv, Vdim, dtype=value.dtype, device=device
         )
+        seg_b_out = torch.empty(
+            seg_b_len, Hv, Vdim, dtype=value.dtype, device=device
+        )
+        out_slots = [seg_a_out, seg_b_out]
         captured_final_state = None
         last_seg_idx = num_segs - 1
-        for slot, seg_idx in enumerate(owned):
-            q_seg = _slice_seg(query, seg_idx)
-            k_seg = _slice_seg(key, seg_idx)
-            v_seg = _slice_seg(value, seg_idx)
-            g_seg = _slice_seg(g, seg_idx)
-            beta_seg = _slice_seg(beta, seg_idx)
+        for slot in range(SEG_PER_RANK):
+            seg_len = owned_lens[slot]
+            start = owned_starts[slot]
+            seg_idx = owned_seg_idx[slot]
+            cu_seg = torch.tensor([0, seg_len], dtype=torch.int32, device=device)
+            q_seg = _slice_local(query, start, seg_len)
+            k_seg = _slice_local(key, start, seg_len)
+            v_seg = _slice_local(value, start, seg_len)
+            g_seg = _slice_local(g, start, seg_len)
+            beta_seg = _slice_local(beta, start, seg_len)
             S_init_seg = S_init[seg_idx].clone().contiguous()
             o, _, _ = chunk_gated_delta_rule(
                 q=q_seg,
@@ -716,35 +882,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 use_qk_l2norm_in_kernel=True,
                 M_out=None,
             )
-            out_pair[slot] = o[0]  # [seg_len, Hv, Vdim]
+            out_slots[slot].copy_(o[0])  # [seg_len, Hv, Vdim]
             if seg_idx == last_seg_idx:
                 captured_final_state = S_init_seg[0].clone().contiguous()
 
-        # All-gather Pass-2 outputs and reorder to causal full-T.
-        out_gathered = torch.empty(
-            num_segs, seg_len, Hv, Vdim, dtype=value.dtype, device=device
+        # === Assemble local-T output (no outer all_gather; model handles it) ===
+        # Layout matches mixed_qkv input: [seg_a_out, seg_b_out] concatenated.
+        # The kernel expects [batch=1, T, Hv, Vdim] but downstream code
+        # squeezes batch out at radix_linear_attention.forward — match the
+        # standard non-CP shape: [1, local_T, Hv, Vdim].
+        core_attn_out = torch.cat([seg_a_out, seg_b_out], dim=0).reshape(
+            1, local_T, Hv, Vdim
         )
-        attn_cp_all_gather_into_tensor(out_gathered, out_pair.contiguous())
-        out_causal = out_gathered[perm_t]
-        core_attn_out = out_causal.reshape(1, num_segs * seg_len, Hv, Vdim)
 
-        # ssm_state writeback for decode-after-CP-prefill.
-        #
-        # The scheduler clears CP metadata on the extend→decode transition,
-        # so decode runs the standard non-CP path which reads
-        # ssm_states[cache_indices[0]] on each rank. Every CP rank therefore
-        # needs the full-sequence final state in its local cache slot.
-        #
-        # Rank 0 owns the last causal segment (zigzag pairing puts seg_0 and
-        # seg_{num_segs-1} on rank 0) and has already captured the kernel's
-        # in-place final-state writeback for that segment. We all-gather and
-        # use rank 0's slot — using the kernel's actual writeback (rather
-        # than reconstructing it via the affine chain) keeps the non-CP and
-        # CP paths bit-identical for decode.
-        #
-        # conv_state writeback is already done by causal_conv1d_fn above:
-        # every rank ran full-T conv1d on identical inputs, so the per-rank
-        # writes are idempotent.
+        # === ssm_state writeback for decode-after-CP-prefill ===
+        # Rank 0 owns seg_(2cp-1) — the last causal segment — and has
+        # captured the kernel's in-place final-state writeback. All-gather
+        # and use rank 0's slot. Same protocol as V19.1.
         if captured_final_state is None:
             captured_final_state = torch.empty(
                 Hv, Vdim, Kdim, dtype=torch.float32, device=device
