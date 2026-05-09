@@ -43,9 +43,20 @@ from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGa
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
+    get_attention_cp_rank,
+    get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
+)
+
+# Context Parallel for the GDN linear-attention path. Only the GDN backend
+# consumes this metadata; the standard attn_cp_metadata is intentionally left
+# unset (see Qwen3_5ForCausalLM.forward).
+from sglang.srt.layers.utils.cp_utils import (
+    can_cp_split,
+    is_prefill_context_parallel_enabled,
+    prepare_context_parallel_metadata,
 )
 
 # Layers - Others
@@ -1085,6 +1096,42 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        # CP wiring for the GDN backend only.
+        #
+        # We deliberately do NOT set forward_batch.attn_cp_metadata. The standard
+        # field activates downstream paths (MoE communicator, KV cache writeback,
+        # lm_head gather) that assume hidden_states has been split to local-T,
+        # which is incompatible with the AMD aiter full-attn backend (no CP
+        # support) used for the non-GDN layers in this hybrid model.
+        #
+        # Instead we attach private fields read only by GDNAttnBackend; every
+        # other layer sees attn_cp_metadata is None and runs full-T redundantly
+        # per CP rank. The GDN backend internally splits, runs the zigzag
+        # two-pass + (b, M) chain reduce, and returns full-T output.
+        if is_prefill_context_parallel_enabled():
+            cp_size = get_attention_cp_size()
+            # input_ids is None when this forward is invoked from
+            # general_mm_embed_routine; fall back to input_embeds in that case.
+            if input_ids is not None:
+                seq_len_for_cp = input_ids.shape[0]
+            elif input_embeds is not None:
+                seq_len_for_cp = input_embeds.shape[0]
+            else:
+                seq_len_for_cp = None
+            if (
+                cp_size > 1
+                and seq_len_for_cp is not None
+                and can_cp_split(seq_len_for_cp, cp_size, forward_batch)
+            ):
+                forward_batch._gdn_cp_metadata = prepare_context_parallel_metadata(
+                    seq_len_for_cp,
+                    get_attention_cp_rank(),
+                    cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                )
+                forward_batch._gdn_cp_size = cp_size
+                forward_batch._gdn_cp_rank = get_attention_cp_rank()
+
         # Initialize hidden states
         if self.pp_group.is_first_rank:
             if input_embeds is None:
