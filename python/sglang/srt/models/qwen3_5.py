@@ -43,9 +43,18 @@ from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGa
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
+    get_attention_cp_rank,
+    get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
+)
+
+# === V15 (B3): minimal CP wiring (set attn_cp_metadata only; backend handles the rest) ===
+from sglang.srt.layers.utils.cp_utils import (
+    can_cp_split,
+    is_prefill_context_parallel_enabled,
+    prepare_context_parallel_metadata,
 )
 
 # Layers - Others
@@ -1085,6 +1094,36 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        # === V15 (B3) — minimal CP wiring ===
+        # GDN-backend-only CP. We set a CUSTOM attribute (_gdn_cp_metadata) that the
+        # GDN backend reads, leaving forward_batch.attn_cp_metadata = None so that
+        # the MoE communicator's CP path (which expects local-T hidden_states) does
+        # NOT activate. Hidden_states stays full-T everywhere. Only GDN backend
+        # internally splits → does (b,M) merge → returns full-T.
+        # Full-attn (aiter) layers run full-T redundantly across CP ranks.
+        if is_prefill_context_parallel_enabled():
+            cp_size = get_attention_cp_size()
+            cp_rank = get_attention_cp_rank()
+            # gate fix from V8: input_ids may be None when called via general_mm_embed_routine
+            seq_len_for_cp = None
+            if input_ids is not None:
+                seq_len_for_cp = len(input_ids)
+            elif input_embeds is not None:
+                seq_len_for_cp = input_embeds.shape[0]
+            if (
+                cp_size > 1
+                and seq_len_for_cp is not None
+                and can_cp_split(seq_len_for_cp, cp_size, forward_batch)
+            ):
+                forward_batch._gdn_cp_metadata = prepare_context_parallel_metadata(
+                    seq_len_for_cp,
+                    cp_rank,
+                    cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                )
+                forward_batch._gdn_cp_size = cp_size
+                forward_batch._gdn_cp_rank = cp_rank
+
         # Initialize hidden states
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -1142,6 +1181,28 @@ class Qwen3_5ForCausalLM(nn.Module):
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
+
+        # === V16: hidden state dump for cp=1 vs cp=2 validation ===
+        # Gated by env var DUMP_HS to avoid runtime cost in production. Dumps
+        # post-norm hidden_states (the input to lm_head) on each prefill.
+        # One file per (cp_size, world_rank) per call.
+        import os as _os
+        if (
+            _os.getenv("DUMP_HS") == "1"
+            and forward_batch.forward_mode.is_extend()
+            and hidden_states.shape[0] >= 64
+        ):
+            try:
+                import torch.distributed as _dist
+                _world_rank = _dist.get_rank() if _dist.is_initialized() else 0
+                _cp_size = getattr(forward_batch, "_gdn_cp_size", get_attention_cp_size())
+                _path = f"/tmp/v16_cp{_cp_size}_rank{_world_rank}_T{hidden_states.shape[0]}_hs.pt"
+                if not _os.path.exists(_path):  # one-shot per file
+                    torch.save(hidden_states.detach().float().cpu(), _path)
+                    print(f"[V16 DUMP] saved {_path} shape={tuple(hidden_states.shape)}",
+                          flush=True)
+            except Exception as _e:
+                print(f"[V16 DUMP ERROR] {_e}", flush=True)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
