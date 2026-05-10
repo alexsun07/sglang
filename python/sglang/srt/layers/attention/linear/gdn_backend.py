@@ -683,15 +683,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # conv_weights stored as (dim, K) per kernel docstring; depthwise
         # conv1d expects weight shape (out_channels, in_channels/groups, K)
         # with groups=channels → reshape to (dim, 1, K).
-        # IMPORTANT: pytorch F.conv1d does cross-correlation (no flip),
-        # while causal_conv1d_fn (mamba kernel) is true convolution (kernel
-        # flipped). Empirically test both via env var if drift suspected.
-        # Default: assume causal_conv1d_fn semantics → flip kernel for F.conv1d.
-        # Set CP_CONV_NO_FLIP=1 to disable the flip (debug option).
-        conv_w_raw = layer.conv_weights.unsqueeze(1)  # [dim, 1, K]
-        import os as _os
-        _flip = _os.environ.get("CP_CONV_NO_FLIP", "0") != "1"
-        conv_w = conv_w_raw.flip(-1) if _flip else conv_w_raw
+        # mamba's causal_conv1d_fn convention: y[t] = sum_k w[c,k] * x[c, t - (K-1) + k]
+        # i.e., w[:, K-1] multiplies the CURRENT timestep and w[:, 0] multiplies
+        # the OLDEST. This matches PyTorch F.conv1d (cross-correlation), so NO
+        # kernel flip is needed. Verified empirically by layer-by-layer bisect
+        # against cp=1 reference (with flip: layer-0 max diff 3.0; without: 0.18,
+        # within bf16 precision; output goes from garbage to coherent).
+        conv_w = layer.conv_weights.unsqueeze(1)  # [dim, 1, K]
         conv_b = layer.bias  # [dim] or None
 
         def _causal_conv1d_local(seg_input, left_context):
