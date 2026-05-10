@@ -205,6 +205,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.moe_needs_tp_reduce = (
+            get_moe_expert_parallel_world_size() > 1
+            or get_tensor_model_parallel_world_size() // (
+                get_moe_expert_parallel_world_size()
+                * get_moe_data_parallel_world_size()
+            ) > 1
+        )
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         if self.tp_size > config.num_experts:
@@ -466,12 +473,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # An out-of-place add would allocate a new tensor outside symm
             # memory, breaking subsequent symmetric collective operations.
             final_hidden_states += shared_output
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+        if self.moe_needs_tp_reduce and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
             use_reduce_scatter=use_reduce_scatter,
             should_allreduce_fusion=should_allreduce_fusion,
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if get_moe_data_parallel_world_size() > 1:
+                from sglang.srt.distributed.parallel_state import get_moe_ep_group
+                final_hidden_states = get_moe_ep_group().all_reduce(final_hidden_states)
+            else:
+                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
