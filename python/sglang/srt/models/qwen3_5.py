@@ -50,11 +50,6 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 
-# Standard zigzag CP wiring (post alex/zigzag-cp aiter+CP support):
-# split hidden_states at model entry, run all layers on local-T per rank,
-# gather at model exit. GDN backend internally re-splits owned segments
-# from the local-T input; full-attn (aiter) handles its own split via
-# cp_attn_forward_extend / cp_allgather_and_save_kv_cache.
 from sglang.srt.layers.utils.cp_utils import (
     can_cp_split,
     cp_all_gather_rerange_output,
@@ -1078,22 +1073,15 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         self.layers_to_capture = []
 
-        # Standard zigzag CP attributes (mirror qwen3_moe.py:976-981).
-        # Used by cp_all_gather_rerange_output at model exit.
         self.attn_cp_size = get_attention_cp_size()
         self.attn_cp_rank = get_attention_cp_rank()
 
-        # Defensive MoE constraint enforcement (per bef256b63 commit message
-        # documenting upstream MoE-TP/CP interaction). Without this assert,
-        # silent garbage output if launched with moe_tp_size > 1 + CP enabled.
         if self.attn_cp_size > 1:
             moe_tp = get_moe_tensor_parallel_world_size()
             assert moe_tp == 1, (
-                f"Qwen3.5 + prefill CP requires moe_tp_size == 1 "
-                f"(upstream MoE-TP/CP interaction; see bef256b63 commit "
-                f"message). Got moe_tp_size={moe_tp}. Set --moe-dp-size and "
-                f"--ep-size so tp_size / (moe_dp_size * ep_size) == 1. "
-                f"Recommended: tp=4 cp=2 → --moe-dp-size 2 --ep-size 2."
+                f"Qwen3.5 + prefill CP requires moe_tp_size == 1. "
+                f"Got moe_tp_size={moe_tp}. Set --moe-dp-size and "
+                f"--ep-size so tp_size / (moe_dp_size * ep_size) == 1."
             )
 
     def get_input_embeddings(self):
@@ -1122,12 +1110,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        # Standard zigzag CP wiring (post alex/zigzag-cp aiter+CP support).
-        # Sets standard forward_batch.attn_cp_metadata which activates:
-        #   - aiter_backend: cp_attn_forward_extend + cp_allgather_and_save_kv_cache
-        #   - GDN backend: internal owned-segment split (input is local-T per rank)
-        #   - cp_split_and_rebuild_data after embed → local-T per rank for all layers
-        #   - cp_all_gather_rerange_output before return → full-T for lm_head
+        # Zigzag CP: prepare metadata for sequence splitting.
         if is_prefill_context_parallel_enabled():
             cp_size = self.attn_cp_size
             # input_ids is None when this forward is invoked from
@@ -1162,9 +1145,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        # Split hidden_states + positions to local-T per rank (zigzag layout:
-        # rank r owns 2 segments, concatenated as [seg_r, seg_(2cp-1-r)]).
-        # All subsequent layers operate on local-T per rank.
+        # Split to local-T per rank (zigzag layout).
         if (
             is_prefill_context_parallel_enabled()
             and forward_batch.forward_mode.is_context_parallel_extend()
@@ -1220,8 +1201,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
-        # Gather local-T per rank back to full-T in causal order before lm_head.
-        # Mirror qwen2_moe.py:826-836 / qwen3_moe.py exit pattern.
+        # Gather local-T back to full-T before lm_head.
         if (
             self.pp_group.is_last_rank
             and is_prefill_context_parallel_enabled()

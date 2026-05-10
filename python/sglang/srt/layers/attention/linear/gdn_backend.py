@@ -518,48 +518,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     # CP-aware prefill for the GDN linear-attention path.
     #
-    # mixed_qkv arrives LOCAL-T per rank because the model layer (in
-    # qwen3_5.py post-zigzag-cp) calls cp_split_and_rebuild_data after
-    # embed; subsequent layers (in_proj, conv1d, GDN body, etc.) all
-    # operate on local-T per rank. This backend's contract:
-    #   - input: mixed_qkv shape [seg_a_len + seg_b_len, q_dim+k_dim+v_dim]
-    #     where seg_a = rank's first owned segment (= seg_(cp_rank)),
-    #           seg_b = rank's second owned segment (= seg_(2cp-1-cp_rank))
-    #     in causal order: seg_a is earlier in the full sequence.
-    #   - output: same local-T layout (the model's exit
-    #     cp_all_gather_rerange_output gathers + reorders to full-T
-    #     before lm_head).
+    # Input: local-T mixed_qkv [seg_a_len + seg_b_len, dim] per rank
+    #   (model splits at embed, gathers at exit before lm_head).
     #
     # Algorithm (zigzag two-pass + (b, M) chain reduce):
-    #
-    #   conv1d: D1a boundary exchange — each rank exchanges (K-1) tokens
-    #           with adjacent ranks for left-context, then runs F.conv1d
-    #           on each owned segment locally. Sequence stays sharded;
-    #           only K-1 = 3 tokens × hidden cross the wire per layer.
-    #           Middle rank (cp_size-1)'s seg_b feed comes intra-rank
-    #           from its own seg_a tail — no P2P for that pair.
-    #   Pass 1: each rank runs its 2 owned segments with initial_state=0
-    #           and captures (b_seg, M_seg) — the segment's affine output
-    #           on the recurrent state.
-    #   Reduce: all_gather (b, M); each rank deterministically chains the
-    #           per-segment affine maps in fp32 to derive S_init for every
-    #           segment.
-    #   Pass 2: each rank reruns its 2 owned segments with the correct
-    #           S_init and emits the per-segment outputs.
-    #   Output: simple concat([seg_a_out, seg_b_out]) → return local-T.
-    #           No outer all_gather (model layer's exit handles that).
-    #
-    # ssm_state writeback (decode-after-CP): rank 0 owns seg_(2cp-1) (the
-    # last causal segment) and captures the Pass 2 final state, then
-    # all_gather + use slot 0 → all ranks write same state to local cache.
-    #
-    # conv_state writeback: rank 0's seg_b INPUT tail (last K-1 tokens of
-    # mixed_qkv before conv) is the full-sequence conv_state. Rank 0
-    # broadcasts via cp_group; all ranks write same conv_state to local
-    # cache slot.
-    #
-    # Constraints (see report.md §1.4): prefix=0 only, no cuda graph,
-    # batch=1, attn_tp ∈ {1, 2}.
+    #   1. conv1d boundary exchange: all_gather (K-1) tail tokens from
+    #      adjacent segments, run F.conv1d per segment locally.
+    #   2. Pass 1: run each owned segment with init_state=0, capture the
+    #      affine recurrence maps (b, M) per segment.
+    #   3. Chain reduce: all_gather (b, M), chain S_init[i+1] = M[i]*S[i] + b[i]
+    #      in fp32 to derive correct initial states.
+    #   4. Pass 2: rerun owned segments with correct S_init, emit output.
+    #   5. Writeback conv_state and ssm_state to cache for decode.
     def _forward_extend_cp(
         self,
         layer: RadixLinearAttention,
@@ -589,16 +559,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             f"{seg_a_len} + {seg_b_len}), got mixed_qkv.shape[0]={mixed_qkv.shape[0]}"
         )
 
-        # === D1a: conv1d via boundary exchange ===
-        # K = conv kernel size. Stored on conv_weights as last dim.
-        # conv_weights shape per causal_conv1d_fn docstring: (dim, K).
+        # === conv1d boundary exchange ===
         K = layer.conv_weights.shape[-1]
-        Kp = K - 1  # left-context size needed for causal conv1d
-
-        # Pre-compute own segment tails (last Kp tokens of each owned seg's
-        # INPUT mixed_qkv). If a segment is shorter than Kp, left-pad with
-        # zeros (matches conv1d causal-pad semantics for very short segs;
-        # in practice seg_len >> K=4 since CP is gated by seq_len >= 2cp*64).
+        Kp = K - 1
         def _tail(seg_input):
             if seg_input.shape[0] >= Kp:
                 return seg_input[-Kp:].contiguous()
@@ -612,44 +575,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         own_seg_a_tail = _tail(seg_a_input)
         own_seg_b_tail = _tail(seg_b_input)
 
-        # === D1a forensic probe (reviewer instrumentation ask 1) ===
-        # First-forward only, per backend instance: confirms layer.activation
-        # matches our F.silu assumption + records cp/seg dims for postmortem
-        # if numerical drift shows up.
-        if not getattr(self, "_d1a_logged", False):
-            print(
-                f"[D1a] activation={layer.activation!r} K={K} dim={dim} "
-                f"cp_rank={cp_rank} cp_size={cp_size} "
-                f"seg_a_len={seg_a_len} seg_b_len={seg_b_len} local_T={local_T}",
-                flush=True,
-            )
-            self._d1a_logged = True
-
-        # === Boundary exchange via single all_gather ===
-        # Original D1a design used 4× cp_group.send/recv (Ring A + Ring B).
-        # Empirically (Stage 2 boot) NCCL warns:
-        #   "An unbatched P2P op (send/recv) was called on this ProcessGroup
-        #    with size 2. In lazy initialization mode, this will result in
-        #    a new 2-rank NCCL communicator to be created."
-        # With 45 GDN layers × 4 P2P ops each, this creates many tiny
-        # sub-communicators on the hot path → server hangs at warmup.
-        #
-        # Refactor: pack (seg_a_tail, seg_b_tail) per rank, all_gather across
-        # cp_group (collective op, no lazy sub-comm creation), then locally
-        # pick the correct left-feeds based on rank-counting logic. Total
-        # collective volume per layer per rank = cp_size × 2 × Kp × dim ≈
-        # cp_size × 48KB at qwen3.5 dims; still trivial vs the (b,M)
-        # all_gathers already on this path.
-        #
-        # Causal ownership recap:
-        #   rank r owns seg_a = seg_(r) and seg_b = seg_(2cp-1-r).
-        #   seg_a's prev (in causal order) = seg_(r-1), owned by rank (r-1)
-        #     as ITS seg_a (slot 0). For r=0, no prev → zeros.
-        #   seg_b's prev = seg_(2cp-2-r), owned by:
-        #     - if 2cp-2-r < cp_size: rank (2cp-2-r) as its seg_a (slot 0)
-        #       — happens when r >= cp_size-1, i.e., for the middle rank
-        #       cp_size-1 (where 2cp-2-r = cp_size-1 = own rank's seg_a).
-        #     - else: rank (r+1) as ITS seg_b (slot 1).
+        # === Boundary exchange via all_gather ===
+        # Pack each rank's segment tails, all_gather, then locally pick the
+        # correct left-context feeds for each owned segment.
         cp_group = get_attention_cp_group()
         zeros_tail = torch.zeros(Kp, dim, dtype=dtype, device=device)
 
@@ -661,34 +589,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         attn_cp_all_gather_into_tensor(all_tails, local_tails.contiguous())
 
-        # Pick left-feed for seg_a (= seg_(cp_rank))
         if cp_rank == 0:
             seg_a_left = zeros_tail
         else:
-            # prev = seg_(cp_rank-1) = rank (cp_rank-1)'s seg_a (slot 0)
             seg_a_left = all_tails[cp_rank - 1, 0]
 
-        # Pick left-feed for seg_b (= seg_(2cp-1-cp_rank))
-        # prev = seg_(2cp-2-cp_rank)
         prev_b_idx = 2 * cp_size - 2 - cp_rank
         if prev_b_idx < cp_size:
-            # First-half segment, owned by rank (prev_b_idx) as its seg_a.
-            # When prev_b_idx == cp_rank (middle rank case): intra-rank.
             seg_b_left = all_tails[prev_b_idx, 0]
         else:
-            # Second-half segment, owned by rank (cp_rank+1) as its seg_b.
             seg_b_left = all_tails[cp_rank + 1, 1]
 
         # === Per-segment causal conv1d via F.conv1d (depthwise) ===
-        # conv_weights stored as (dim, K) per kernel docstring; depthwise
-        # conv1d expects weight shape (out_channels, in_channels/groups, K)
-        # with groups=channels → reshape to (dim, 1, K).
-        # mamba's causal_conv1d_fn convention: y[t] = sum_k w[c,k] * x[c, t - (K-1) + k]
-        # i.e., w[:, K-1] multiplies the CURRENT timestep and w[:, 0] multiplies
-        # the OLDEST. This matches PyTorch F.conv1d (cross-correlation), so NO
-        # kernel flip is needed. Verified empirically by layer-by-layer bisect
-        # against cp=1 reference (with flip: layer-0 max diff 3.0; without: 0.18,
-        # within bf16 precision; output goes from garbage to coherent).
+        # No kernel flip: causal_conv1d_fn and F.conv1d both use cross-correlation.
         conv_w = layer.conv_weights.unsqueeze(1)  # [dim, 1, K]
         conv_b = layer.bias  # [dim] or None
 
@@ -716,62 +629,37 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mixed_qkv = torch.cat([seg_a_conv, seg_b_conv], dim=0)  # [local_T, dim]
 
         # === conv_state writeback ===
-        # Full-sequence conv_state = last Kp INPUT tokens of seg_(2cp-1).
-        # Rank 0 owns seg_(2cp-1) as its seg_b → own_seg_b_tail (already
-        # computed above) is the right tensor on rank 0.
-        # Use all_gather (same pattern as ssm_state writeback below) instead
-        # of broadcast — pynccl broadcast vs subsequent torch ops on default
-        # stream can race; all_gather via the same `attn_cp_all_gather_into_tensor`
-        # path that the (b,M) gather uses is empirically correctly ordered.
+        # Full-sequence conv_state = last Kp INPUT tokens of seg_(2cp-1),
+        # which is rank 0's seg_b. All-gather and use rank 0's slot.
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         cache_indices = self.forward_metadata.mamba_cache_indices
 
-        # Gather all ranks' seg_b tails; pick rank 0's slot.
         all_seg_b_tails = torch.empty(
             cp_size, Kp, dim, dtype=dtype, device=device
         )
         attn_cp_all_gather_into_tensor(all_seg_b_tails, own_seg_b_tail.contiguous())
-        conv_state_buf = all_seg_b_tails[0]  # rank 0's seg_b tail = full-seq conv state
-        # === conv_states cache layout assert (reviewer instrumentation ask 2) ===
-        _expected_slot_shape = (dim, Kp)
-        _actual_slot_shape = tuple(conv_states[cache_indices[0]].shape)
-        assert _actual_slot_shape == _expected_slot_shape, (
-            f"GDN CP D1a conv_state writeback layout mismatch: expected "
-            f"{_expected_slot_shape} (dim, K-1), got {_actual_slot_shape}. "
-            f"conv_states.shape={tuple(conv_states.shape)}, "
-            f"cache_indices[0]={cache_indices[0].item()}"
-        )
-        conv_states[cache_indices[0]] = conv_state_buf.transpose(0, 1).to(
+        conv_states[cache_indices[0]] = all_seg_b_tails[0].transpose(0, 1).to(
             conv_states.dtype
         )
 
-        # === Split q/k/v + gating on local-T ===
         query, key, value = torch.split(
             mixed_qkv,
             [layer.q_dim, layer.k_dim, layer.v_dim],
             dim=-1,
         )
-        Hq = layer.num_q_heads
-        Hk = layer.num_k_heads
-        Hv = layer.num_v_heads
-        Kdim = layer.head_k_dim
-        Vdim = layer.head_v_dim
-        # Reshape: [local_T, H*D] → [1, local_T, H, D] (kernel expects batch dim)
+        Hq, Hk, Hv = layer.num_q_heads, layer.num_k_heads, layer.num_v_heads
+        Kdim, Vdim = layer.head_k_dim, layer.head_v_dim
         query = query.view(1, local_T, Hq, layer.head_q_dim)
         key = key.view(1, local_T, Hk, Kdim)
         value = value.view(1, local_T, Hv, Vdim)
         g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
-        # === Slice into 2 owned segments (already in (prev,next) layout) ===
         state_idx = torch.tensor([0], dtype=torch.int64, device=device)
-        # slice fn: returns [1, seg_len, H, D] for kernel input
         def _slice_local(t, start, length):
             return t.narrow(1, start, length).contiguous()
 
-        # owned[slot=0] = seg_a (= seg_cp_rank, length seg_a_len, starts at 0)
-        # owned[slot=1] = seg_b (= seg_(2cp-1-cp_rank), length seg_b_len, starts at seg_a_len)
         owned_starts = [0, seg_a_len]
         owned_lens = [seg_a_len, seg_b_len]
         owned_seg_idx = [cp_rank, num_segs - 1 - cp_rank]
@@ -823,8 +711,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         attn_cp_all_gather_into_tensor(b_gathered, b_pair.contiguous())
         attn_cp_all_gather_into_tensor(M_gathered, M_pair.contiguous())
 
-        # Reorder rank-major (rank 0 head, rank 0 tail, rank 1 head, ...)
-        # to causal segment order. Identical perm logic to old design.
+        # Reorder from rank-major to causal segment order.
         perm = []
         for i in range(num_segs):
             owner = min(i, num_segs - 1 - i)
@@ -884,19 +771,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if seg_idx == last_seg_idx:
                 captured_final_state = S_init_seg[0].clone().contiguous()
 
-        # === Assemble local-T output (no outer all_gather; model handles it) ===
-        # Layout matches mixed_qkv input: [seg_a_out, seg_b_out] concatenated.
-        # The kernel expects [batch=1, T, Hv, Vdim] but downstream code
-        # squeezes batch out at radix_linear_attention.forward — match the
-        # standard non-CP shape: [1, local_T, Hv, Vdim].
+        # Assemble local-T output matching input layout.
         core_attn_out = torch.cat([seg_a_out, seg_b_out], dim=0).reshape(
             1, local_T, Hv, Vdim
         )
 
-        # === ssm_state writeback for decode-after-CP-prefill ===
-        # Rank 0 owns seg_(2cp-1) — the last causal segment — and has
-        # captured the kernel's in-place final-state writeback. All-gather
-        # and use rank 0's slot. Same protocol as V19.1.
+        # === ssm_state writeback ===
+        # Rank 0 owns the last causal segment; all-gather its final state.
         if captured_final_state is None:
             captured_final_state = torch.empty(
                 Hv, Vdim, Kdim, dtype=torch.float32, device=device
