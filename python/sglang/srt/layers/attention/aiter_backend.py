@@ -25,10 +25,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.utils.cp_utils import (
-    cp_allgather_and_save_kv_cache,
-    cp_attn_forward_extend,
-)
+from sglang.srt.layers.utils.cp_utils import cp_allgather_and_save_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_gfx95_supported
 
@@ -152,7 +149,14 @@ class AiterAttnBackend(AttentionBackend):
         )
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
-        self.attn_cp_size = getattr(model_runner, "attn_cp_size", 1)
+        self.attn_cp_size = model_runner.attn_cp_size
+        if self.attn_cp_size > 1:
+            # Reused per layer × per zigzag half in the CP path; only slot [1]
+            # is updated. Allocate once instead of building a fresh tensor for
+            # every mha_batch_prefill_func call.
+            self.cp_kv_indptr_buf = torch.zeros(
+                2, dtype=torch.int32, device=self.device
+            )
 
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
@@ -2746,25 +2750,32 @@ class AiterAttnBackend(AttentionBackend):
                     page_table = self.forward_metadata.swa_page_table
 
             if is_cp_mode:
+                # Inline the prev/next zigzag split rather than using
+                # cp_attn_forward_extend so we can pass max_kv_len as the int
+                # already cached in cp_meta (kv_len_prev / kv_len_next),
+                # avoiding a per-layer .item() host sync that the AITER
+                # kernel's int-typed max_seqlen_k argument would otherwise
+                # require.
                 cp_meta = forward_batch.attn_cp_metadata
+                q_full = q.contiguous().view(
+                    -1, layer.tp_q_head_num, layer.head_dim
+                )
+                q_prev, q_next = torch.chunk(q_full, 2, dim=0)
 
-                def _aiter_cp_attn(
-                    q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp
-                ):
-                    kv_len_cp = int(cache_seqlens_cp.item())
-                    kv_indptr_cp = torch.tensor(
-                        [0, kv_len_cp], device=self.device, dtype=torch.int32
+                def _aiter_cp_attn_half(q_chunk, kv_len, q_len):
+                    cu_seqlens_q = torch.tensor(
+                        [0, q_len], device=self.device, dtype=torch.int32
                     )
-                    page_table_cp = page_table[:kv_len_cp]
+                    self.cp_kv_indptr_buf[1] = kv_len
                     return mha_batch_prefill_func(
                         q_chunk,
                         k_cache,
                         v_cache,
-                        cu_seqlens_q_cp,
-                        kv_indptr_cp,
-                        page_table_cp,
-                        max_seqlen_q_cp,
-                        kv_len_cp,
+                        cu_seqlens_q,
+                        self.cp_kv_indptr_buf,
+                        page_table[:kv_len],
+                        q_len,
+                        kv_len,
                         causal=True,
                         logits_soft_cap=self.logits_soft_cap,
                         alibi_slopes=None,
@@ -2777,12 +2788,13 @@ class AiterAttnBackend(AttentionBackend):
                         v_descale=v_descale,
                     )
 
-                o = cp_attn_forward_extend(
-                    forward_batch,
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    self.device,
-                    _aiter_cp_attn,
+                o_prev = _aiter_cp_attn_half(
+                    q_prev, cp_meta.kv_len_prev, cp_meta.actual_seq_q_prev
                 )
+                o_next = _aiter_cp_attn_half(
+                    q_next, cp_meta.kv_len_next, cp_meta.actual_seq_q_next
+                )
+                o = torch.cat([o_prev, o_next], dim=0)
             else:
                 o = mha_batch_prefill_func(
                     q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
