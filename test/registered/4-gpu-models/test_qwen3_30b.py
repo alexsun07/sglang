@@ -13,20 +13,29 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=261, suite="stage-c-test-4-gpu-h100")
-# AMD path uses the AITER attention backend (default on HIP) and disables the
-# full cuda graph due to a separate AITER + cuda graph correctness issue
-# tracked outside this file. The CP attention code in aiter_backend.py is the
-# same code that the CUDA test exercises in flashattention_backend.py.
+# AMD path uses the AITER attention backend (default on HIP). The CP code in
+# aiter_backend.py is the same shape FA uses in flashattention_backend.py.
 register_amd_ci(est_time=300, suite="stage-c-test-4-gpu-amd")
 
 _IS_HIP = is_hip()
 
 
 def _platform_extra_args():
-    # On AMD/AITER, full cuda graph capture currently produces incorrect
-    # decode outputs (separate AITER issue, not specific to CP). Until that
-    # is fixed upstream, disable cuda graph for the AMD CI run.
-    return ["--disable-cuda-graph"] if _IS_HIP else []
+    # AITER's custom all-reduce has a relaxed-memory-ordering data race that
+    # surfaces when the entire decode forward is dispatched as a single cuda
+    # graph (allreduce reads can land before peer writes). Falling back to
+    # NCCL for the allreduce sidesteps it; cuda graph itself is fine.
+    return ["--disable-custom-all-reduce"] if _IS_HIP else []
+
+
+def _platform_extra_env():
+    # When the attention CP process group exists, PyTorch's NCCL watchdog
+    # races with cuda-graph capture on HIP: it polls hipEventQuery on Work
+    # whose completion event lives on the capturing stream, which HIP
+    # forbids (`hipErrorCapturedEvent`). Switching to blocking-wait mode
+    # disables the watchdog thread and lets capture complete. Not needed
+    # on CUDA — the FA backend's CP test runs without it.
+    return {"TORCH_NCCL_BLOCKING_WAIT": "1"} if _IS_HIP else None
 
 QWEN3_30B_MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
 
@@ -62,6 +71,7 @@ class TestQwen330B(CustomTestCase):
                 '{"enable_multithread_load": true, "num_threads": 64}',
                 *_platform_extra_args(),
             ],
+            env=_platform_extra_env(),
         )
 
     @classmethod
@@ -118,6 +128,7 @@ class TestQwen330BCP(CustomTestCase):
                 '{"enable_multithread_load": true, "num_threads": 64}',
                 *_platform_extra_args(),
             ],
+            env=_platform_extra_env(),
         )
 
     @classmethod
