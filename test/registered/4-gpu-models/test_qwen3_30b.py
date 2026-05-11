@@ -1,7 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -12,6 +13,20 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=261, suite="stage-c-test-4-gpu-h100")
+# AMD path uses the AITER attention backend (default on HIP) and disables the
+# full cuda graph due to a separate AITER + cuda graph correctness issue
+# tracked outside this file. The CP attention code in aiter_backend.py is the
+# same code that the CUDA test exercises in flashattention_backend.py.
+register_amd_ci(est_time=300, suite="stage-c-test-4-gpu-amd")
+
+_IS_HIP = is_hip()
+
+
+def _platform_extra_args():
+    # On AMD/AITER, full cuda graph capture currently produces incorrect
+    # decode outputs (separate AITER issue, not specific to CP). Until that
+    # is fixed upstream, disable cuda graph for the AMD CI run.
+    return ["--disable-cuda-graph"] if _IS_HIP else []
 
 QWEN3_30B_MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
 
@@ -45,6 +60,7 @@ class TestQwen330B(CustomTestCase):
                 "--disable-piecewise-cuda-graph",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
+                *_platform_extra_args(),
             ],
         )
 
@@ -100,6 +116,7 @@ class TestQwen330BCP(CustomTestCase):
                 "--disable-piecewise-cuda-graph",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
+                *_platform_extra_args(),
             ],
         )
 
