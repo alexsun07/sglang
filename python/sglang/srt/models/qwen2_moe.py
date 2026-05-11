@@ -29,8 +29,11 @@ from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_moe_data_parallel_world_size,
     get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    moe_expert_parallel_all_reduce,
+    moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import (
@@ -205,6 +208,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.moe_tp_size = get_moe_tensor_parallel_world_size()
+        self.moe_ep_size = get_moe_expert_parallel_world_size()
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         if self.tp_size > config.num_experts:
@@ -466,12 +471,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # An out-of-place add would allocate a new tensor outside symm
             # memory, breaking subsequent symmetric collective operations.
             final_hidden_states += shared_output
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+        if self.moe_ep_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=False,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
+        ):
+            final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
+        if self.moe_tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
             use_reduce_scatter=use_reduce_scatter,
             should_allreduce_fusion=should_allreduce_fusion,
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = moe_tensor_model_parallel_all_reduce(
+                final_hidden_states
+            )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 

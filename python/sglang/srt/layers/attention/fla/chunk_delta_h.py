@@ -271,6 +271,97 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
 
+def compute_M_total_pytorch_ref(
+    k: torch.Tensor,        # [B=1, T_total, Hg, K]  bf16
+    w: torch.Tensor,        # [B=1, T_total, H,  K]  bf16
+    g_cumsum: torch.Tensor, # [B=1, T_total, H]      fp32 (chunk-local cumsum, same as fwd_h's g input)
+    cu_seqlens: torch.LongTensor,
+    M_out: torch.Tensor,    # [N, H, K, K] fp32 — pre-allocated output, filled in place
+    chunk_size: int = CHUNK_SIZE,
+) -> None:
+    """Compute the segment-end ``M_total`` matrix used by the (b, M)-merge
+    Context Parallel scheme for GDN linear-attention.
+
+    For each (sequence n, head h), ``M[n, h]`` is defined by the affine
+    recurrence over the segment's NT chunks::
+
+        b_h_after = b_h_initial @ M[n, h] + b_seg[n, h]
+
+    Per chunk t (NT chunks total, applied in causal order)::
+
+        N_chunk[h, k_in, k_out] = γ^C[h] · I[k_in, k_out]
+                                  - Σ_t W[t, h, k_in] · K_arrow[t, h, k_out]
+
+    where ``K_arrow[t, h, k] = exp(g_last[h] - g_chunk[t, h]) · K[t, h, k]``;
+    the γ-to-end factor mirrors ``fwd_h``'s ``b_v`` scaling above. Then
+    ``M_seg = N_chunk_1 @ N_chunk_2 @ ... @ N_chunk_NT``.
+
+    This is a PyTorch reference and the source of truth for the math; a
+    fused Triton kernel can be substituted later for perf without changing
+    the semantics.
+    """
+    assert k.shape[0] == 1, "varlen path expects B=1"
+    assert M_out.dtype == torch.float32, "M_out must be fp32"
+    assert g_cumsum is not None, "compute_M_total_pytorch_ref requires g (USE_G path)"
+
+    _, T_total, Hg, K = k.shape
+    H = w.shape[2]
+    group_size = H // Hg
+    N = len(cu_seqlens) - 1
+    assert M_out.shape == (N, H, K, K)
+
+    device = k.device
+    eye_K = torch.eye(K, dtype=torch.float32, device=device)
+
+    cu = cu_seqlens.tolist() if cu_seqlens.is_cuda else cu_seqlens.cpu().tolist()
+
+    for n in range(N):
+        bos, eos = int(cu[n]), int(cu[n + 1])
+        T_seg = eos - bos
+        NT = (T_seg + chunk_size - 1) // chunk_size
+
+        # Initialize M = identity for each head: [H, K, K]
+        M = eye_K.unsqueeze(0).expand(H, K, K).contiguous()
+
+        for i_t in range(NT):
+            t0 = i_t * chunk_size
+            t1 = min(t0 + chunk_size, T_seg)
+            BT_actual = t1 - t0
+
+            # Slice this chunk
+            k_chunk = k[0, bos + t0 : bos + t1]                     # [BT, Hg, K]   bf16
+            w_chunk = w[0, bos + t0 : bos + t1]                     # [BT, H,  K]   bf16
+            g_chunk = g_cumsum[0, bos + t0 : bos + t1]              # [BT, H]       fp32 (chunk-local cumsum)
+
+            # Expand k from Hg head-groups to H full heads (GVA: H/Hg = group_size)
+            # k_chunk[t, hg, k] -> k_expanded[t, hg*group_size + g, k]
+            k_expanded = (
+                k_chunk[:, :, None, :]
+                .expand(BT_actual, Hg, group_size, K)
+                .reshape(BT_actual, H, K)
+                .float()
+            )                                                        # [BT, H, K] fp32
+
+            # γ-to-end factor for each (token, head): exp(g_last - g_t)
+            g_last = g_chunk[-1]                                     # [H]      fp32
+            gamma_to_end = torch.exp(g_last[None, :] - g_chunk)      # [BT, H]
+            gamma_C = torch.exp(g_last)                              # [H]
+
+            # K_arrow[t, h, k] = gamma_to_end[t, h] * k_expanded[t, h, k]
+            K_arrow = gamma_to_end[:, :, None] * k_expanded          # [BT, H, K]
+
+            # WK[h, k_in, k_out] = Σ_t w_chunk[t, h, k_in] · K_arrow[t, h, k_out]
+            WK = torch.einsum("thi,thj->hij", w_chunk.float(), K_arrow)  # [H, K, K]
+
+            # N_chunk[h] = γ^C[h] · I - WK[h]
+            N_chunk = gamma_C[:, None, None] * eye_K[None, :, :] - WK    # [H, K, K]
+
+            # Update M ← M @ N_chunk per head
+            M = torch.bmm(M, N_chunk)                                    # [H, K, K]
+
+        M_out[n].copy_(M)
+
+
 def chunk_gated_delta_rule_fwd_h(
     k: torch.Tensor,
     w: torch.Tensor,
@@ -282,7 +373,8 @@ def chunk_gated_delta_rule_fwd_h(
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: Optional[torch.LongTensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    M_out: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE
@@ -335,4 +427,14 @@ def chunk_gated_delta_rule_fwd_h(
         num_warps=4,
         num_stages=2,
     )
+
+    # Optionally fill the segment-end M matrix used by the GDN Context
+    # Parallel (b, M)-merge path. Default M_out=None skips this entirely
+    # (zero numeric or perf impact for non-CP callers).
+    if M_out is not None:
+        compute_M_total_pytorch_ref(
+            k=k, w=w, g_cumsum=g, cu_seqlens=cu_seqlens,
+            M_out=M_out, chunk_size=BT,
+        )
+
     return h, v_new

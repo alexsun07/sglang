@@ -43,9 +43,23 @@ from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGa
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
+    get_attention_cp_rank,
+    get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
+)
+
+from sglang.srt.layers.utils.cp_utils import (
+    can_cp_split,
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    is_prefill_context_parallel_enabled,
+    prepare_context_parallel_metadata,
+)
+from sglang.srt.distributed.parallel_state import (
+    get_moe_tensor_parallel_world_size,
 )
 
 # Layers - Others
@@ -1059,6 +1073,17 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         self.layers_to_capture = []
 
+        self.attn_cp_size = get_attention_cp_size()
+        self.attn_cp_rank = get_attention_cp_rank()
+
+        if self.attn_cp_size > 1:
+            moe_tp = get_moe_tensor_parallel_world_size()
+            assert moe_tp == 1, (
+                f"Qwen3.5 + prefill CP requires moe_tp_size == 1. "
+                f"Got moe_tp_size={moe_tp}. Set --moe-dp-size and "
+                f"--ep-size so tp_size / (moe_dp_size * ep_size) == 1."
+            )
+
     def get_input_embeddings(self):
         return self.embed_tokens
 
@@ -1085,6 +1110,29 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        # Zigzag CP: prepare metadata for sequence splitting.
+        if is_prefill_context_parallel_enabled():
+            cp_size = self.attn_cp_size
+            # input_ids is None when this forward is invoked from
+            # general_mm_embed_routine; fall back to input_embeds in that case.
+            if input_ids is not None:
+                seq_len_for_cp = input_ids.shape[0]
+            elif input_embeds is not None:
+                seq_len_for_cp = input_embeds.shape[0]
+            else:
+                seq_len_for_cp = None
+            if (
+                cp_size > 1
+                and seq_len_for_cp is not None
+                and can_cp_split(seq_len_for_cp, cp_size, forward_batch)
+            ):
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                    seq_len_for_cp,
+                    self.attn_cp_rank,
+                    cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                )
+
         # Initialize hidden states
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -1096,6 +1144,16 @@ class Qwen3_5ForCausalLM(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+
+        # Split to local-T per rank (zigzag layout).
+        if (
+            is_prefill_context_parallel_enabled()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            if self.pp_group.is_first_rank:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
 
         aux_hidden_states = []
         # Pass through decoder layers
@@ -1142,6 +1200,20 @@ class Qwen3_5ForCausalLM(nn.Module):
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
+
+        # Gather local-T back to full-T before lm_head.
+        if (
+            self.pp_group.is_last_rank
+            and is_prefill_context_parallel_enabled()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            hidden_states = cp_all_gather_rerange_output(
+                hidden_states,
+                self.attn_cp_size,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
 
         if len(aux_hidden_states) == 0:
             return hidden_states

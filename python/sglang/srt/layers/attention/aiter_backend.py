@@ -25,6 +25,10 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.utils.cp_utils import (
+    cp_allgather_and_save_kv_cache,
+    cp_attn_forward_extend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_gfx95_supported
 
@@ -147,6 +151,8 @@ class AiterAttnBackend(AttentionBackend):
             get_attention_tp_size()
         )
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+
+        self.attn_cp_size = getattr(model_runner, "attn_cp_size", 1)
 
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
@@ -2328,9 +2334,15 @@ class AiterAttnBackend(AttentionBackend):
             k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
             v_descale = layer.v_scale if layer.v_scale is not None else self.k_scale
 
+        is_cp_mode = (
+            forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+            and self.attn_cp_size > 1
+        )
+
         if k is not None:
             assert v is not None
-            if save_kv_cache:
+            if save_kv_cache and not is_cp_mode:
                 # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
                 # both unified attention and sliding window kv pool are active.
                 # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
@@ -2370,6 +2382,10 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, k_descale, v_descale
                     )
+            if is_cp_mode:
+                cp_allgather_and_save_kv_cache(
+                    forward_batch, layer, k, v, self.attn_cp_size
+                )
 
         if self.use_mla:
             max_q_len = self.forward_metadata.max_q_len
@@ -2729,26 +2745,65 @@ class AiterAttnBackend(AttentionBackend):
                 if self.forward_metadata.swa_page_table is not None:
                     page_table = self.forward_metadata.swa_page_table
 
-            o = mha_batch_prefill_func(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache,
-                v_cache,
-                self.qo_indptr[:bs0],
-                self.forward_metadata.kv_indptr[:bs0],
-                page_table,
-                self.forward_metadata.max_q_len,
-                self.forward_metadata.max_kv_len,
-                causal=True,
-                logits_soft_cap=self.logits_soft_cap,
-                alibi_slopes=None,
-                return_lse=False,
-                return_attn_probs=False,
-                window_size=window_size,
-                sink_ptr=sinks,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-            )
+            if is_cp_mode:
+                cp_meta = forward_batch.attn_cp_metadata
+
+                def _aiter_cp_attn(
+                    q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp
+                ):
+                    kv_len_cp = int(cache_seqlens_cp.item())
+                    kv_indptr_cp = torch.tensor(
+                        [0, kv_len_cp], device=self.device, dtype=torch.int32
+                    )
+                    page_table_cp = page_table[:kv_len_cp]
+                    return mha_batch_prefill_func(
+                        q_chunk,
+                        k_cache,
+                        v_cache,
+                        cu_seqlens_q_cp,
+                        kv_indptr_cp,
+                        page_table_cp,
+                        max_seqlen_q_cp,
+                        kv_len_cp,
+                        causal=True,
+                        logits_soft_cap=self.logits_soft_cap,
+                        alibi_slopes=None,
+                        return_lse=False,
+                        return_attn_probs=False,
+                        window_size=window_size,
+                        sink_ptr=sinks,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                    )
+
+                o = cp_attn_forward_extend(
+                    forward_batch,
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    self.device,
+                    _aiter_cp_attn,
+                )
+            else:
+                o = mha_batch_prefill_func(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache,
+                    v_cache,
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.kv_indptr[:bs0],
+                    page_table,
+                    self.forward_metadata.max_q_len,
+                    self.forward_metadata.max_kv_len,
+                    causal=True,
+                    logits_soft_cap=self.logits_soft_cap,
+                    alibi_slopes=None,
+                    return_lse=False,
+                    return_attn_probs=False,
+                    window_size=window_size,
+                    sink_ptr=sinks,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
 
             # The fp8bf16 aiter prefill kernel returns bf16 even when the
             # model computes in fp16. Cast back so the attention output keeps
