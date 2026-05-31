@@ -343,7 +343,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             return None
         shared_out = self.shared_expert_gate(hidden_states)
         shared_logits = shared_out[0] if isinstance(shared_out, tuple) else shared_out
-        return F.sigmoid(shared_logits)
+        w = F.sigmoid(shared_logits)
+        # Allreduce-EP path: the fused shared expert's weights are EP-replicated
+        # (not EP-sharded), so every rank computes the same full shared output.
+        # The post-experts all_reduce then sums it moe_ep_size times. Pre-scale
+        # by 1/moe_ep_size to cancel. Mirrors DeepSeek-V2's existing
+        # fused_shared_experts_scaling_factor pattern (see deepseek_v2.py).
+        moe_ep_size = self.experts.moe_ep_size
+        if moe_ep_size > 1 and not get_moe_a2a_backend().is_deepep():
+            w = w / float(moe_ep_size)
+        return w
 
     def _append_shared_to_topk_output(
         self,
