@@ -3208,12 +3208,35 @@ class MiniMaxSparseKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+    def _dense_nhd_kv(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        # The dense layers run on SGLang's stock (triton) backend, which reads
+        # these singular accessors as flat NHD [slot, H, D]. When the ATOM Gluon
+        # sparse path forces the shared main pool into the vectorized_5d layout,
+        # gather it back to NHD so the dense kernel sees the layout it expects.
+        # (Sparse layers use get_kv_buffer and handle 5D themselves.)
+        from sglang.srt.layers.attention.utils import (
+            launch_gather_shuffle_5d_to_linear,
+        )
+
+        k5d = self.main_pool.get_key_buffer(layer_id)
+        v5d = self.main_pool.get_value_buffer(layer_id)
+        total_slots = k5d.shape[0] * k5d.shape[3]
+        all_slots = torch.arange(total_slots, dtype=torch.int64, device=k5d.device)
+        return launch_gather_shuffle_5d_to_linear(k5d, v5d, all_slots)
+
+    def _main_is_vectorized_5d(self) -> bool:
+        return getattr(self.main_pool, "kv_cache_layout", None) == "vectorized_5d"
+
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         self._wait_for_layer(layer_id)
+        if self._main_is_vectorized_5d():
+            return self._dense_nhd_kv(layer_id)[0]
         return self.main_pool.get_key_buffer(layer_id)
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
         self._wait_for_layer(layer_id)
+        if self._main_is_vectorized_5d():
+            return self._dense_nhd_kv(layer_id)[1]
         return self.main_pool.get_value_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -3324,6 +3347,12 @@ class MiniMaxSparseKVPool(KVCache):
         return (
             envs.SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE.get()
             and _is_cuda
+            # The fused store_kv_index kernel is a raw NHD byte copy; it does not
+            # understand the vectorized_5d SHUFFLE layout. With a 5D main cache it
+            # would scatter K/V in NHD order into a SHUFFLE-shaped buffer, giving
+            # garbage on read-back (decode). Force the set_kv_buffer fallback,
+            # which routes to launch_reshape_and_cache_shuffle_5d.
+            and getattr(main, "kv_cache_layout", None) != "vectorized_5d"
             # No dtype conversion / fp8 scaling on either side (the fused kernel
             # is a raw byte copy, it does not quantize).
             and main.store_dtype == main.dtype

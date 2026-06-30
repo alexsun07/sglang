@@ -1,5 +1,6 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
+import logging
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -10,6 +11,8 @@ from .decode.flash_with_topk_idx import flash_decode_with_topk_idx
 from .decode.topk_sparse import flash_decode_with_gqa_share_sparse
 from .prefill.flash_with_topk_idx import flash_prefill_with_topk_index
 from .prefill.topk_sparse import flash_prefill_with_gqa_share_sparse
+
+logger = logging.getLogger(__name__)
 
 
 def minimax_sparse_prefill(
@@ -58,6 +61,21 @@ def minimax_sparse_prefill(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k, seqlens_cpu
         )
 
+    use_atom_env = False
+    try:
+        from sglang.srt.environ import envs
+
+        use_atom_env = envs.SGLANG_MINIMAX_M3_ATOM_PREFILL.get()
+    except Exception:
+        use_atom_env = False
+
+    if use_atom_env and idx_k_cache.dim() == 5:
+        from .atom_prefill import vectorized_5d_index_cache_to_nhd
+
+        idx_k_cache = vectorized_5d_index_cache_to_nhd(idx_k_cache)
+        if idx_v_cache is not None and idx_v_cache.dim() == 5:
+            idx_v_cache = vectorized_5d_index_cache_to_nhd(idx_v_cache)
+
     # All seqlen is less than topk, use full attention
     # Step 1: Flash attention with topk index (using index head)
     idx_o, topk_idx = flash_prefill_with_topk_index(
@@ -95,7 +113,43 @@ def minimax_sparse_prefill(
     # Step 3: Sparse attention using topk index (main head). The MSA path only
     # replaces this step; the indexer above is unchanged. MSA has no attn-sink
     # input, so keep the Triton path when sink is present.
-    if use_msa and sink is None:
+    use_atom_prefill = False
+    try:
+        if use_atom_env:
+            from .atom_prefill import can_use_atom_prefill
+
+            use_atom_prefill = can_use_atom_prefill(
+                q, k_cache, v_cache, sink, block_size_k
+            )
+            if not use_atom_prefill:
+                logger.warning(
+                    "SGLANG_MINIMAX_M3_ATOM_PREFILL is set, but the current "
+                    "MiniMax-M3 prefill batch/cache layout is unsupported; "
+                    "falling back to the default sparse prefill path."
+                )
+    except Exception as exc:
+        logger.warning(
+            "Failed to initialize MiniMax-M3 ATOM prefill path; falling back: %s",
+            exc,
+        )
+        use_atom_prefill = False
+
+    if use_atom_prefill:
+        from .atom_prefill import atom_gluon_sparse_prefill
+
+        o = atom_gluon_sparse_prefill(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            topk_idx=topk_idx,
+            req_to_token=req_to_token,
+            req_pool_indices=slot_ids,
+            cu_seqlens=cu_seqlens,
+            prefix_lens=prefix_lens,
+            block_size_k=block_size_k,
+            sm_scale=sm_scale,
+        )
+    elif use_msa and sink is None:
         from .msa import msa_sparse_prefill_main
 
         o = msa_sparse_prefill_main(
@@ -165,6 +219,21 @@ def minimax_sparse_decode(
     ] = None,  # per-forward MSA page table (cached)
     msa_plan=None,  # per-forward MSA fmha_sm100 plan (cached)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    use_atom_env = False
+    try:
+        from sglang.srt.environ import envs
+
+        use_atom_env = envs.SGLANG_MINIMAX_M3_ATOM_PREFILL.get()
+    except Exception:
+        use_atom_env = False
+
+    if use_atom_env and idx_k_cache.dim() == 5:
+        from .atom_prefill import vectorized_5d_index_cache_to_nhd
+
+        idx_k_cache = vectorized_5d_index_cache_to_nhd(idx_k_cache)
+        if idx_v_cache is not None and idx_v_cache.dim() == 5:
+            idx_v_cache = vectorized_5d_index_cache_to_nhd(idx_v_cache)
+
     # Step 1: Flash decode with topk index (using index head). When the dense main
     # attention is used, the indexer emits the page table directly (fused
     # transform) instead of block ids, plus the per-query effective KV length.
@@ -200,8 +269,20 @@ def minimax_sparse_decode(
             topk_idx = topk_index_reduce(
                 topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
             )
-        # Step 3: Sparse attention using topk index (main head). The MSA path
-        # only replaces this step; keep the Triton path when sink is present.
+        # Step 3: Sparse attention using topk index (main head). Decode stays on
+        # SGLang's Triton sparse path; when the main cache is vectorized_5d (for
+        # the prefill Gluon path) gather it back to NHD so that kernel can read it.
+        if use_atom_env and k_cache.dim() == 5:
+            from sglang.srt.layers.attention.utils import (
+                launch_gather_shuffle_5d_to_linear,
+            )
+
+            total_slots = k_cache.shape[0] * k_cache.shape[3]
+            all_slots = torch.arange(total_slots, dtype=torch.int64, device=q.device)
+            k_cache, v_cache = launch_gather_shuffle_5d_to_linear(
+                k_cache, v_cache, all_slots
+            )
+
         if use_msa and sink is None:
             from .msa import msa_sparse_decode_main
 

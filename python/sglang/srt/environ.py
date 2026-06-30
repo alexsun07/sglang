@@ -915,6 +915,10 @@ class Envs:
     # MSA kernel (fmha_sm100) is importable on Blackwell. Kill-switch for A/B and
     # for falling back if MSA misbehaves; otherwise MSA auto-enables when available.
     SGLANG_DISABLE_MSA = EnvBool(False)
+    # MiniMax-M3 sparse prefill: experimental ATOM-style path. This is a narrow
+    # hack for MI355/MXFP8 long-prefill A/B only; default stays on the upstream
+    # SGLang sparse path.
+    SGLANG_MINIMAX_M3_ATOM_PREFILL = EnvBool(False)
     # MiniMax-M3 MXFP8 MoE: experimental fusion toggles (default off; A/B only).
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)

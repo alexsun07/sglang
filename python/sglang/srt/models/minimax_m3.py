@@ -357,7 +357,7 @@ class MiniMaxM3MoE(nn.Module):
             gemm1_alpha=config.swiglu_alpha,
             gemm1_clamp_limit=config.swiglu_limit,
             prefix=add_prefix("experts", prefix),
-            interleaved=False,
+            gate_up_interleaved=False,
         )
         # use sigmoid_topk, instead of grouped_topk
         self.topk = TopK(
@@ -1079,8 +1079,14 @@ class MiniMaxM3Attention(nn.Module):
         # write (the index cache stays bf16, so its fusion is unaffected but is
         # bundled in the same kernel, hence the whole fusion is skipped).
         main_kv_is_fp8 = kv_pool is not None and kv_pool.dtype in _FP8_KV_DTYPES
+        main_kv_layout = (
+            getattr(getattr(kv_pool, "main_pool", None), "kv_cache_layout", None)
+            if kv_pool is not None
+            else None
+        )
         can_use_cache_fusion = (
             not main_kv_is_fp8
+            and main_kv_layout != "vectorized_5d"
             and idx_v is None
             and self._can_use_rocm_sparse_qk_index_norm_rope(
                 positions, q, k, idx_q, idx_k
