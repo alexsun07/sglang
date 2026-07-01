@@ -3662,7 +3662,30 @@ class ServerArgs:
                     )
                     self.enable_aiter_allreduce_fusion = False
                 if not self.enable_aiter_allreduce_fusion:
-                    self.disable_custom_all_reduce = True
+                    # M3-ROCm force-disables custom all-reduce, falling back to
+                    # NCCL. That blanket disable targets the aiter *fusion* above
+                    # (which corrupts sparse MoE partial outputs); the custom
+                    # all-reduce path itself is fine. Opt-in escape hatch to keep
+                    # it enabled so the QUANTIZED all-reduce (quickreduce) can run.
+                    #
+                    # The win comes from quantization, not from custom AR per se.
+                    # Profiled on MI355X TP4 (80k prefill, TP-0 trace, all-reduce
+                    # GPU-kernel time):
+                    #   NCCL baseline            : 1.166s AR  (ncclDevKernel)
+                    #   custom AR, quant=NONE    : 1.169s AR  (falls back to NCCL!)
+                    #   custom AR, INT8          : 0.771s AR  (quickreduce twoshot)
+                    # i.e. custom-AR alone (NONE) buys nothing -- the large prefill
+                    # all-reduce only leaves NCCL once quickreduce is enabled via
+                    # ROCM_QUICK_REDUCE_QUANTIZATION (INT4/INT8; INT8 is the AMD
+                    # image default). INT8 cuts all-reduce kernel time ~34% and
+                    # total prefill GPU time ~10%. This is the same AITER
+                    # quickreduce ATOM uses. GSM8K 200q 5-shot stays 0.905->0.925
+                    # (no MoE corruption). Small decode all-reduces stay on the
+                    # plain path (too small to quantize).
+                    import os as _os_car
+
+                    if _os_car.environ.get("SGLANG_M3_ENABLE_CUSTOM_AR") != "1":
+                        self.disable_custom_all_reduce = True
             elif is_sm100_supported():
                 # SM100 family (sm_100 B200 / sm_103 B300): fa4 + page 128 let the MSA kernel
                 # (fmha_sm100) take the main sparse-attention step — its gate
