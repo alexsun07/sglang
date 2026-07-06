@@ -47,8 +47,17 @@ def minimax_sparse_prefill(
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
     seqlens_cpu: Optional[List[int]] = None,
+    cached_topk_idx: Optional[torch.Tensor] = None,
+    return_topk_idx: bool = False,
 ):
     """Run MiniMax-M3 sparse prefill.
+
+    Index cache (ATOM #1354): when ``cached_topk_idx`` is given, skip Step 1
+    (the flash-index attention + top-k selection) and reuse the provided top-k
+    indices for Step 3's sparse attention. When ``return_topk_idx`` is True, the
+    reduced top-k tensor is returned as a third element so the caller can cache
+    it for later skip layers. Only valid for ``disable_index_value`` layers
+    (idx_o is None there, so skipping the indexer has no output side effect).
 
     ``cu_seqblocks_q``, ``max_seqblock_q``, and ``all_seqblock_q`` are optional
     precomputed query-block metadata shared by the index and value sparse
@@ -77,39 +86,48 @@ def minimax_sparse_prefill(
             idx_v_cache = vectorized_5d_index_cache_to_nhd(idx_v_cache)
 
     # All seqlen is less than topk, use full attention
-    # Step 1: Flash attention with topk index (using index head)
-    idx_o, topk_idx = flash_prefill_with_topk_index(
-        q=idx_q,
-        k_cache=idx_k_cache,
-        v_cache=idx_v_cache,
-        sink=idx_sink,
-        req_to_token=req_to_token,
-        slot_ids=slot_ids,
-        cu_seqlens=cu_seqlens,
-        seq_lens=seq_lens,
-        prefix_lens=prefix_lens,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        block_size_q=block_size_q,
-        block_size_k=block_size_k,
-        topk=topk,
-        init_blocks=init_blocks,
-        local_blocks=local_blocks,
-        sm_scale=idx_sm_scale,
-        score_type=score_type,
-        disable_index_value=disable_index_value,
-        cu_seqblocks_q=cu_seqblocks_q,
-        max_seqblock_q=max_seqblock_q,
-        all_seqblock_q=all_seqblock_q,
-    )
-    # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
-    num_idx_heads = idx_q.shape[1]
-    num_kv_heads = k_cache.shape[1]
-    idx_group_size = num_idx_heads // num_kv_heads
-    if idx_group_size > 1:
-        topk_idx = topk_index_reduce(
-            topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
+    if cached_topk_idx is not None:
+        # Index cache hit: reuse a prior sparse layer's reduced top-k, skipping
+        # Step 1 (flash-index attention + top-k) and Step 2 (reduce). idx_o is
+        # unused downstream for disable_index_value layers.
+        idx_o = None
+        topk_idx = cached_topk_idx
+    else:
+        # Step 1: Flash attention with topk index (using index head)
+        idx_o, topk_idx = flash_prefill_with_topk_index(
+            q=idx_q,
+            k_cache=idx_k_cache,
+            v_cache=idx_v_cache,
+            sink=idx_sink,
+            req_to_token=req_to_token,
+            slot_ids=slot_ids,
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            block_size_q=block_size_q,
+            block_size_k=block_size_k,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            sm_scale=idx_sm_scale,
+            score_type=score_type,
+            disable_index_value=disable_index_value,
+            cu_seqblocks_q=cu_seqblocks_q,
+            max_seqblock_q=max_seqblock_q,
+            all_seqblock_q=all_seqblock_q,
         )
+        # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
+        num_idx_heads = idx_q.shape[1]
+        num_kv_heads = k_cache.shape[1]
+        idx_group_size = num_idx_heads // num_kv_heads
+        if idx_group_size > 1:
+            topk_idx = topk_index_reduce(
+                topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
+            )
+    # Reduced top-k to be cached by the caller for subsequent skip layers.
+    reduced_topk_idx = topk_idx
     # Step 3: Sparse attention using topk index (main head). The MSA path only
     # replaces this step; the indexer above is unchanged. MSA has no attn-sink
     # input, so keep the Triton path when sink is present.
@@ -184,6 +202,8 @@ def minimax_sparse_prefill(
             cu_seqblocks_q=cu_seqblocks_q,
             max_seqblock_q=max_seqblock_q,
         )
+    if return_topk_idx:
+        return idx_o, o, reduced_topk_idx
     return idx_o, o
 
 

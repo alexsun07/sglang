@@ -166,10 +166,30 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # fused decode top-k kernel each layer, so the backend keeps no metadata.
         self.dense_backend: Optional[AttentionBackend] = None
 
+        # Index cache (ATOM #1354): share indexer top-k across groups of
+        # consecutive sparse layers. freq=N -> each group of N sparse layers
+        # computes top-k once (first layer) and the other N-1 reuse it. Prefill
+        # only for now (decode runs under cuda graph; the per-forward host dict
+        # would not be graph-safe). Only the group's source layer computes.
+        self.index_topk_freq = max(int(envs.SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ.get()), 1)
+        self.index_cache_enabled = self.index_topk_freq > 1
+        # Map each sparse layer_id -> (group_key, is_source). Source layers compute
+        # and store; non-source layers in a group reuse the stored top-k. Groups run
+        # over the sparse-layer ordinal (position among sparse layers only).
+        self._topk_group_of_layer: dict[int, int] = {}
+        self._topk_is_source: dict[int, bool] = {}
+        for ordinal, lid in enumerate(self.sparse_layer_ids):
+            group = ordinal // self.index_topk_freq
+            self._topk_group_of_layer[lid] = group
+            self._topk_is_source[lid] = (ordinal % self.index_topk_freq) == 0
+        # Per-forward cache {group_key: reduced_topk_idx}; cleared each forward.
+        self._topk_cache: dict = {}
+
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
             f"main_attn={'MSA' if self.use_msa else 'triton'}, "
+            f"index_topk_freq={self.index_topk_freq}, "
             f"disable_value_layers={sorted(self.disable_value_layer_ids)})"
         )
 
@@ -184,6 +204,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # and TARGET_VERIFY sets it to None despite is_extend() — getattr covers both.
         # New forward -> invalidate the cached per-forward MSA decode metadata.
         self._msa_dec_meta = None
+        # New forward -> drop the per-forward index-cache top-k (prefill only).
+        if self.index_cache_enabled:
+            self._topk_cache = {}
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is not None:
             self._max_seqlen_q = int(max(extend_lens))
@@ -256,6 +279,20 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ) -> bool:
         layer_ids = forward_batch.minimax_m3_precached_sparse_layers
         return layer_ids is not None and layer_id in layer_ids
+
+    def index_topk_skipped(self, layer_id: int, disable_value: bool) -> bool:
+        """Whether this sparse layer reuses another layer's top-k (index cache).
+
+        When True, the layer never runs the indexer (no flash-index attention,
+        no top-k), so its index Q/K norm+rope is dead work the model can skip.
+        Only valid for disable_value layers (idx_o is None there). Prefill-only:
+        decode always computes its own top-k, so callers must gate on is_extend.
+        """
+        return (
+            self.index_cache_enabled
+            and disable_value
+            and not self._topk_is_source.get(layer_id, True)
+        )
 
     def forward(
         self,
@@ -349,7 +386,21 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             q = q[:actual_num_tokens]
             idx_q = idx_q[:actual_num_tokens]
 
-        idx_o, o = minimax_sparse_prefill(
+        # Index cache (ATOM #1354): only for disable_value layers (idx_o is None,
+        # so skipping the indexer has no output side effect). A group's source
+        # layer computes + stores the reduced top-k; the other layers reuse it.
+        use_index_cache = self.index_cache_enabled and disable_value
+        cached_topk_idx = None
+        want_topk = False
+        if use_index_cache:
+            group = self._topk_group_of_layer[layer.layer_id]
+            if self._topk_is_source[layer.layer_id]:
+                want_topk = True  # compute and store for this group
+            else:
+                cached_topk_idx = self._topk_cache.get(group)
+                # Miss (e.g. source layer chunked differently) -> recompute safely.
+
+        result = minimax_sparse_prefill(
             q,
             k_cache,
             v_cache,
@@ -375,7 +426,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             use_msa=self.use_msa,
             # Host seq-lens let get_cu_seqblocks avoid a per-layer .item() sync.
             seqlens_cpu=forward_batch.extend_seq_lens_cpu,
+            cached_topk_idx=cached_topk_idx,
+            return_topk_idx=want_topk,
         )
+        if want_topk:
+            idx_o, o, reduced_topk_idx = result
+            self._topk_cache[group] = reduced_topk_idx
+        else:
+            idx_o, o = result
 
         # Pad output back to original size for DP communication
         if actual_num_tokens < original_num_tokens:
