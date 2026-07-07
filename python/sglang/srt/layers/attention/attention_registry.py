@@ -267,8 +267,22 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
 
         sparse_backend = MiniMaxSparseAttnBackend(runner)
+        # aiter dense decode (pa_decode_gluon ps-reduce) only covers context up to
+        # 64 partitions * 256 = 16384 tokens; beyond that aiter's C++ ps-reduce
+        # rejects and the flydsl fallback crashes (std::bad_cast). Give the hybrid
+        # a triton decode backend to fall back to for long-context dense decode
+        # only; short decode stays on aiter (fast + KV-consistent with aiter
+        # prefill). Only wired when the dense backend is aiter.
+        dense_decode_backend = None
+        if type(full_attn_backend).__name__ == "AiterAttnBackend":
+            from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+            dense_decode_backend = TritonAttnBackend(runner)
         return MiniMaxHybridAttnBackend(
-            full_attn_backend, sparse_backend, sparse_backend.sparse_layer_ids
+            full_attn_backend,
+            sparse_backend,
+            sparse_backend.sparse_layer_ids,
+            dense_decode_backend=dense_decode_backend,
         )
 
     if cfg := runner.mambaish_config:

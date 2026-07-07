@@ -241,6 +241,12 @@ class AiterAttnBackend(AttentionBackend):
                 return getattr(pool.full_kv_pool, "kv_cache_layout", "nhd") == (
                     "vectorized_5d"
                 )
+            # MiniMax-M3 hybrid pool: the real KV layout lives on main_pool. Detect
+            # it so the dense layers this aiter backend serves route through the
+            # 5D prefill/decode specializations (forward_*_vectorized_5d).
+            main_pool = getattr(pool, "main_pool", None)
+            if main_pool is not None:
+                return getattr(main_pool, "kv_cache_layout", "nhd") == "vectorized_5d"
             return getattr(pool, "kv_cache_layout", "nhd") == "vectorized_5d"
 
         self.kv_cache_is_vectorized_5d = _pool_is_vec5d(model_runner.token_to_kv_pool)

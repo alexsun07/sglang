@@ -584,15 +584,23 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 class MiniMaxHybridAttnBackend(AttentionBackend):
     """Combines a dense backend and a sparse backend, routing by call site."""
 
+    # aiter dense gluon decode ps-reduce covers at most 64 partitions * 256 tokens.
+    _GLUON_DECODE_MAX_CTX = 64 * 256  # 16384
+
     def __init__(
         self,
         dense_backend: AttentionBackend,
         sparse_backend: MiniMaxSparseAttnBackend,
         sparse_layer_ids: list[int],
+        dense_decode_backend: Optional[AttentionBackend] = None,
     ):
         self.dense = dense_backend
         self.sparse = sparse_backend
         self.sparse_layer_ids = sparse_layer_ids
+        # Fallback backend for LONG-CONTEXT dense DECODE only (triton), used when
+        # context exceeds what aiter's gluon decode can cover (see forward()).
+        # None -> all dense decode uses self.dense.
+        self.dense_decode = dense_decode_backend
         # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend
 
@@ -600,16 +608,33 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         # delegate so the dense (FlashInfer) backend keeps its own eager init.
         self.sparse.init_forward_metadata(forward_batch)
         self.dense.init_forward_metadata(forward_batch)
+        # Only init the triton decode fallback when it will actually be used
+        # (long-context dense decode). Initing it unconditionally perturbs shared
+        # runner scratch and regresses the normal aiter path. See _needs_dense_decode.
+        if self._needs_dense_decode(forward_batch):
+            self.dense_decode.init_forward_metadata(forward_batch)
+
+    def _needs_dense_decode(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            self.dense_decode is not None
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.seq_lens_cpu is not None
+            and int(forward_batch.seq_lens_cpu.max()) > self._GLUON_DECODE_MAX_CTX
+        )
 
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
         self.sparse.init_forward_metadata_out_graph(forward_batch, in_capture)
         self.dense.init_forward_metadata_out_graph(forward_batch, in_capture)
+        if self._needs_dense_decode(forward_batch):
+            self.dense_decode.init_forward_metadata_out_graph(forward_batch, in_capture)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self.sparse.init_forward_metadata_in_graph(forward_batch)
         self.dense.init_forward_metadata_in_graph(forward_batch)
+        if self._needs_dense_decode(forward_batch):
+            self.dense_decode.init_forward_metadata_in_graph(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.dense.init_cuda_graph_state(max_bs, max_num_tokens)
@@ -641,6 +666,19 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         # the real token count and re-pad the output; k/v stay untrimmed so the
         # KV-cache write stays aligned with out_cache_loc. Prefill-only.
         mode = forward_batch.forward_mode
+        # Long-context dense DECODE fallback: aiter's gluon decode ps-reduce only
+        # covers <= 16384 tokens (64 partitions); beyond that it crashes. Route
+        # just those steps to the triton decode backend. Short decode stays on
+        # aiter (self.dense) — fast and KV-consistent with aiter prefill.
+        if (
+            mode.is_decode_or_idle()
+            and self.dense_decode is not None
+            and forward_batch.seq_lens_cpu is not None
+            and int(forward_batch.seq_lens_cpu.max()) > self._GLUON_DECODE_MAX_CTX
+        ):
+            return self.dense_decode.forward(
+                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+            )
         if mode.is_extend() and forward_batch.extend_seq_lens_cpu is not None:
             actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
             original_num_tokens = q.shape[0]
@@ -694,7 +732,14 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
             return self.sparse.forward_decode(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
-        else:
-            return self.dense.forward_decode(
+        if (
+            self.dense_decode is not None
+            and forward_batch.seq_lens_cpu is not None
+            and int(forward_batch.seq_lens_cpu.max()) > self._GLUON_DECODE_MAX_CTX
+        ):
+            return self.dense_decode.forward_decode(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
+        return self.dense.forward_decode(
+            q, k, v, layer, forward_batch, save_kv_cache, **kwargs
+        )

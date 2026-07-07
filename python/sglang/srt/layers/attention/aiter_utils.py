@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+import triton
 
 try:
     # `mha_batch_prefill_func` is re-exported at the aiter top level via
@@ -141,6 +142,10 @@ def forward_extend_vectorized_5d(
     if hasattr(pool, "layers_mapping"):
         sub_layer_id, sub_is_swa = pool.layers_mapping[layer.layer_id]
         sub_pool = pool.swa_kv_pool if sub_is_swa else pool.full_kv_pool
+    elif getattr(pool, "main_pool", None) is not None:
+        # MiniMax-M3 hybrid pool: the raw 5D K/V buffers live on main_pool.
+        sub_pool = pool.main_pool
+        sub_layer_id = layer.layer_id
     else:
         sub_pool = pool
         sub_layer_id = layer.layer_id
@@ -256,9 +261,46 @@ def forward_decode_vectorized_5d(
         max_part_num = 1
         sliding_window_arg = int(layer.sliding_window_size)
     else:
-        block_tables_pa = backend.forward_metadata.kv_indices
+        # pa_decode_gluon needs a 2D BLOCK-level page table [bs, max_blocks] whose
+        # entries are physical page ids (slot // page_size), NOT the flat per-token
+        # slot list forward_metadata.kv_indices holds for decode. Feeding the flat
+        # list makes the kernel read wrong slots -> garbage. Build the block table
+        # from req_to_token (mirrors the sparse/atom path).
+        page_size = backend.page_size
+        if page_size > 1:
+            from sglang.srt.layers.attention.triton_ops.aiter_unified_attention import (
+                scatter_req_to_token_to_page_table_kernel,
+            )
+
+            max_blocks = (backend.max_context_len + page_size - 1) // page_size
+            block_tables_pa = torch.zeros(
+                bs, max_blocks, dtype=torch.int32, device=q.device
+            )
+            grid = (bs, triton.cdiv(max(max_blocks, 1), 1024))
+            scatter_req_to_token_to_page_table_kernel[grid](
+                backend.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                block_tables_pa,
+                backend.req_to_token.stride(0),
+                block_tables_pa.stride(0),
+                None,
+                None,
+                0,  # DRAFT_NUM
+                page_size,  # PAGE_SIZE
+                1024,  # BLOCK_SIZE
+                False,  # HAS_SWA
+            )
+        else:
+            block_tables_pa = backend.forward_metadata.kv_indices
         ctx_part = 256
-        max_part_num = get_recommended_splits(bs, num_kv_heads)
+        # Each partition covers exactly ctx_part tokens with no inner loop, so
+        # max_part_num must be >= cdiv(context, ctx_part) to cover the sequence.
+        # get_recommended_splits is only a parallelism hint (cap 8); using it
+        # alone silently truncates any context > 8*256 = 2048 tokens.
+        max_kv_len = int(backend.forward_metadata.max_kv_len)
+        needed_parts = (max_kv_len + ctx_part - 1) // ctx_part
+        max_part_num = max(get_recommended_splits(bs, num_kv_heads), needed_parts)
         sliding_window_arg = 0
 
     q_in = q.view(-1, num_q_heads, layer.qk_head_dim)
