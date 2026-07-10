@@ -240,8 +240,19 @@ def atom_gluon_sparse_prefill(
 
     out = torch.empty_like(q)
     num_seqs = total_q
-    max_part_num = get_recommended_splits(num_seqs, 1)
     ctx_part = 256
+    # pa_decode_gluon launches exactly max_part_num partitions of ctx_part tokens
+    # each, with no inner loop over partitions, so it covers only
+    # max_part_num * ctx_part tokens. get_recommended_splits is a parallelism hint
+    # (min(cdiv(num_sm, num_seqs), 8)); when num_seqs is large (e.g. a 16k-token
+    # prefill chunk) it collapses to 1 -> only 256 tokens covered. Under a radix
+    # cache hit each query's causal range spans the whole cached prefix, so the
+    # per-query effective KV length (sparse_ctx, up to topk*block = 2048) exceeds
+    # that coverage -> the kernel indexes past the block table -> HIP illegal
+    # memory access. Size max_part_num to cover the longest sparse_ctx.
+    max_ctx = int(sparse_ctx.max().item()) if sparse_ctx.numel() else 0
+    needed_parts = max(1, (max_ctx + ctx_part - 1) // ctx_part)
+    max_part_num = max(get_recommended_splits(num_seqs, 1), needed_parts)
     intermediate_shape = (num_seqs, 1, max_part_num, num_q_heads)
     exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
     max_logits = torch.empty_like(exp_sums)

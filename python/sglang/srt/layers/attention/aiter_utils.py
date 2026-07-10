@@ -24,7 +24,7 @@ try:
     # `aiter/__init__.py` (`from .ops.mha import *`). Note: a bare
     # `from aiter.mha import ...` does NOT work — that module path only
     # exists as `aiter.ops.mha`.
-    from aiter import mha_batch_prefill_func
+    from aiter import flash_attn_varlen_func, mha_batch_prefill_func
     from aiter.ops.triton.attention.unified_attention import unified_attention
     from aiter.ops.triton.gluon.pa_decode_gluon import (
         get_recommended_splits,
@@ -32,6 +32,7 @@ try:
     )
 except ImportError:  # pragma: no cover - import-time guard mirrors aiter_backend
     mha_batch_prefill_func = None
+    flash_attn_varlen_func = None
     pa_decode_gluon = None
     get_recommended_splits = None
     unified_attention = None
@@ -183,30 +184,34 @@ def forward_extend_vectorized_5d(
         k_descale_local = None
         v_descale_local = None
 
-    kv_indptr_lin = backend.forward_metadata.kv_indptr[:bs0]
-    kv_indices_lin = torch.arange(total_kv, dtype=torch.int32, device=k_lin.device)
+    # cu_seqlens_q = extend-token counts (new tokens this chunk); cu_seqlens_k =
+    # full per-request KV length (prefix + extend). max_q = longest extend chunk.
+    cu_seqlens_q = backend.qo_indptr[:bs0]
+    cu_seqlens_k = kv_indptr_lin = backend.forward_metadata.kv_indptr[:bs0]
     max_kv = int(backend.forward_metadata.max_kv_len)
     max_q = int(backend.forward_metadata.max_q_len)
 
-    o = mha_batch_prefill_func(
+    # Under a radix-cache hit the extend length (sq) is far smaller than the full
+    # KV length (sk): e.g. sq=3 new tokens attending sk=80003 cached+new. aiter's
+    # LINEAR-mode mha_batch_prefill_func reads out of bounds for sq << sk (paged
+    # batch prefill assumes sq spans the tail); it crashes with HIP illegal memory
+    # access. flash_attn_varlen_func over the gathered contiguous KV handles the
+    # bottom-right causal (sq < sk) case correctly (this is what ATOM does for its
+    # prefix-cache-hit dense prefill). Use it whenever there is a cached prefix.
+    sliding = (window_size[0], window_size[1], 0)
+    o = flash_attn_varlen_func(
         q_local.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
         k_lin,
         v_lin,
-        backend.qo_indptr[:bs0],
-        kv_indptr_lin,
-        kv_indices_lin,
+        cu_seqlens_q,
+        cu_seqlens_k,
         max_q,
         max_kv,
+        softmax_scale=layer.scaling,
         causal=True,
+        window_size=sliding,
         logits_soft_cap=backend.logits_soft_cap,
-        alibi_slopes=None,
-        return_lse=False,
-        return_attn_probs=False,
-        window_size=window_size,
         sink_ptr=sinks,
-        q_descale=q_descale_local,
-        k_descale=k_descale_local,
-        v_descale=v_descale_local,
     )
     if o.dtype != backend.input_dtype:
         o = o.to(backend.input_dtype)
