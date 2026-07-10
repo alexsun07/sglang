@@ -639,6 +639,10 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.dense.init_cuda_graph_state(max_bs, max_num_tokens)
         self.sparse.init_cuda_graph_state(max_bs, max_num_tokens)
+        if self.dense_decode is not None:
+            # The triton long-context decode fallback also needs its cuda-graph
+            # buffers when decode runs under cuda graph.
+            self.dense_decode.init_cuda_graph_state(max_bs, max_num_tokens)
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.sparse.get_cuda_graph_seq_len_fill_value()
