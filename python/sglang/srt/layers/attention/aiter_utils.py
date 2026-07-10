@@ -25,6 +25,7 @@ try:
     # `from aiter.mha import ...` does NOT work — that module path only
     # exists as `aiter.ops.mha`.
     from aiter import mha_batch_prefill_func
+    from aiter.ops.triton.attention.unified_attention import unified_attention
     from aiter.ops.triton.gluon.pa_decode_gluon import (
         get_recommended_splits,
         pa_decode_gluon,
@@ -33,6 +34,7 @@ except ImportError:  # pragma: no cover - import-time guard mirrors aiter_backen
     mha_batch_prefill_func = None
     pa_decode_gluon = None
     get_recommended_splits = None
+    unified_attention = None
 
 from sglang.srt.layers.attention.utils import launch_gather_shuffle_5d_to_linear
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
@@ -243,109 +245,54 @@ def forward_decode_vectorized_5d(
     Writes the attention output into ``o`` in place (via a stride-0
     safe ``o.view``).
     """
-    bs = forward_batch.batch_size
-    num_kv_heads = layer.tp_k_head_num
+    # Use aiter unified_attention with shuffled_kv_cache=True — it consumes the
+    # SHUFFLE 5D KV cache directly (K: [nb, nkv, hd//x, page, x], V: [nb, nkv,
+    # page//x, hd, x]) and handles arbitrary context length via its own split-kv.
+    # This mirrors ATOM's M3 dense decode (unified_attention + shuffled cache),
+    # and avoids pa_decode_gluon's ps-reduce which caps at 64*256=16384 tokens
+    # and crashes (flydsl std::bad_cast) beyond it. It is also cuda-graph-safe:
+    # no per-step tensor allocation, block table lives in a persistent buffer
+    # built by init_forward_metadata_* (see backend._build_5d_decode_page_table).
     num_q_heads = layer.tp_q_head_num
-    q_group = num_q_heads // num_kv_heads
     is_swa_layer = (
         layer.sliding_window_size is not None and layer.sliding_window_size > -1
     )
-
     if is_swa_layer:
-        block_tables_pa = (
+        window_size = (layer.sliding_window_size - 1, 0)
+        page_table = (
             backend.forward_metadata.swa_page_table
             if backend.forward_metadata.swa_page_table is not None
-            else backend.forward_metadata.kv_indices
+            else backend.forward_metadata.decode_page_table_5d
         )
-        ctx_part = 256
-        max_part_num = 1
-        sliding_window_arg = int(layer.sliding_window_size)
     else:
-        # pa_decode_gluon needs a 2D BLOCK-level page table [bs, max_blocks] whose
-        # entries are physical page ids (slot // page_size), NOT the flat per-token
-        # slot list forward_metadata.kv_indices holds for decode. Feeding the flat
-        # list makes the kernel read wrong slots -> garbage. Build the block table
-        # from req_to_token (mirrors the sparse/atom path).
-        page_size = backend.page_size
-        if page_size > 1:
-            from sglang.srt.layers.attention.triton_ops.aiter_unified_attention import (
-                scatter_req_to_token_to_page_table_kernel,
-            )
+        window_size = (-1, -1)
+        page_table = backend.forward_metadata.decode_page_table_5d
 
-            max_blocks = (backend.max_context_len + page_size - 1) // page_size
-            block_tables_pa = torch.zeros(
-                bs, max_blocks, dtype=torch.int32, device=q.device
-            )
-            grid = (bs, triton.cdiv(max(max_blocks, 1), 1024))
-            scatter_req_to_token_to_page_table_kernel[grid](
-                backend.req_to_token,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                block_tables_pa,
-                backend.req_to_token.stride(0),
-                block_tables_pa.stride(0),
-                None,
-                None,
-                0,  # DRAFT_NUM
-                page_size,  # PAGE_SIZE
-                1024,  # BLOCK_SIZE
-                False,  # HAS_SWA
-            )
-        else:
-            block_tables_pa = backend.forward_metadata.kv_indices
-        ctx_part = 256
-        # Each partition covers exactly ctx_part tokens with no inner loop, so
-        # max_part_num must be >= cdiv(context, ctx_part) to cover the sequence.
-        # get_recommended_splits is only a parallelism hint (cap 8); using it
-        # alone silently truncates any context > 8*256 = 2048 tokens.
-        max_kv_len = int(backend.forward_metadata.max_kv_len)
-        needed_parts = (max_kv_len + ctx_part - 1) // ctx_part
-        max_part_num = max(get_recommended_splits(bs, num_kv_heads), needed_parts)
-        sliding_window_arg = 0
+    max_kv_len = page_table.shape[1] * backend.page_size
 
-    q_in = q.view(-1, num_q_heads, layer.qk_head_dim)
-    # Direct view of o as kernel output — saves a per-layer o.copy_ of
-    # bs * H_q * D bf16 elementwise.
-    o_view = o.view(-1, num_q_heads, layer.v_head_dim)
-    exp_sums = torch.empty(
-        (bs, num_kv_heads, max_part_num, q_group),
-        dtype=torch.float32,
-        device=q_in.device,
-    )
-    max_logits = torch.empty_like(exp_sums)
-    temporary_output = torch.empty(
-        (bs, num_kv_heads, max_part_num, q_group, layer.qk_head_dim),
-        dtype=q_in.dtype,
-        device=q_in.device,
-    )
-
-    # For fp8 KV cache the kernel needs per-tensor dequant scales
-    # (key_scale / value_scale). Without them the fp8 bytes are
-    # interpreted as fp8 values with no dequant.
     key_scale = None
     value_scale = None
     if backend.kv_cache_dtype == fp8_dtype:
         key_scale = layer.k_scale if layer.k_scale is not None else backend.k_scale
         value_scale = layer.v_scale if layer.v_scale is not None else backend.v_scale
 
-    pa_decode_gluon(
-        output=o_view,
-        query=q_in,
-        key_cache=k_cache,
-        value_cache=v_cache,
-        context_lengths=forward_batch.seq_lens,
-        block_tables=block_tables_pa,
+    unified_attention(
+        q=q.view(-1, num_q_heads, layer.qk_head_dim),
+        k=k_cache,
+        v=v_cache,
+        out=o.view(-1, num_q_heads, layer.v_head_dim),
+        cu_seqlens_q=backend.forward_metadata.qo_indptr,
+        max_seqlen_q=1,
+        seqused_k=forward_batch.seq_lens,
+        max_seqlen_k=max_kv_len,
         softmax_scale=layer.scaling,
-        query_length=1,
-        max_context_partition_num=max_part_num,
-        context_partition_size=ctx_part,
-        compute_type=backend.input_dtype,
-        key_scale=key_scale,
-        value_scale=value_scale,
-        exp_sums=exp_sums,
-        max_logits=max_logits,
-        temporary_output=temporary_output,
+        causal=True,
+        window_size=window_size,
+        block_table=page_table,
+        softcap=0,
+        q_descale=None,
+        k_descale=key_scale,
+        v_descale=value_scale,
         sinks=sinks,
-        sliding_window=sliding_window_arg,
-        ps=True,
+        shuffled_kv_cache=True,
     )

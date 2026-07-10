@@ -121,6 +121,9 @@ class ForwardMetadata:
     swa_page_table: Optional[torch.Tensor] = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    # 2D block-level page table [bs, max_blocks] for the SHUFFLE-5D unified_attention
+    # decode path (MiniMax-M3 dense layers). Physical page ids = slot // page_size.
+    decode_page_table_5d: Optional[torch.Tensor] = None
 
 
 global_workspace_buffer = None
@@ -550,6 +553,38 @@ class AiterAttnBackend(AttentionBackend):
             is_causal=is_causal,
         )
 
+    def _build_5d_decode_page_table(self, forward_batch, bs: int) -> torch.Tensor:
+        """2D block-level page table [bs, max_blocks] for the SHUFFLE-5D
+        unified_attention decode path (MiniMax-M3 dense layers). Entries are
+        physical page ids (slot // page_size), built from req_to_token.
+
+        Eager path allocates; the cuda-graph path writes into a persistent
+        buffer (see init_cuda_graph_state / capture / replay).
+        """
+        from sglang.srt.layers.attention.triton_ops.aiter_unified_attention import (
+            scatter_req_to_token_to_page_table_kernel,
+        )
+
+        page_size = self.page_size
+        max_blocks = (self.max_context_len + page_size - 1) // page_size
+        page_table = torch.zeros(bs, max_blocks, dtype=torch.int32, device=self.device)
+        grid = (bs, triton.cdiv(max(max_blocks, 1), 1024))
+        scatter_req_to_token_to_page_table_kernel[grid](
+            self.req_to_token,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            page_table,
+            self.req_to_token.stride(0),
+            page_table.stride(0),
+            None,
+            None,
+            0,  # DRAFT_NUM
+            page_size,  # PAGE_SIZE
+            1024,  # BLOCK_SIZE
+            False,  # HAS_SWA
+        )
+        return page_table
+
     # for page size > 1 useful conversion function
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
         page_size = self.page_size
@@ -910,6 +945,7 @@ class AiterAttnBackend(AttentionBackend):
         num_kv_splits = None
         swa_page_table = None
         swa_out_cache_loc = None
+        decode_page_table_5d = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             swa_out_cache_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
                 forward_batch.out_cache_loc
@@ -934,6 +970,18 @@ class AiterAttnBackend(AttentionBackend):
                         kv_indices,
                         self.req_to_token.stride(0),
                     )
+                    if self.kv_cache_is_vectorized_5d:
+                        # MiniMax-M3 dense layers decode via unified_attention over
+                        # the SHUFFLE-5D cache, which needs a 2D block-level page
+                        # table (physical page ids). Sparse layers still use the
+                        # flat kv_indices above.
+                        decode_page_table_5d = self._build_5d_decode_page_table(
+                            forward_batch, bs
+                        )
+                        # unified_attention needs cu_seqlens_q = [0,1,...,bs]
+                        # (q_len==1 per request); this branch otherwise leaves
+                        # qo_indptr unset for non-MLA decode.
+                        qo_indptr = self.qo_indptr_unified_decode[: bs + 1]
                 else:
                     max_q_len = 1
                     page_size = self.page_size
@@ -1035,6 +1083,7 @@ class AiterAttnBackend(AttentionBackend):
                 run_graph=False,
                 swa_page_table=swa_page_table,
                 swa_out_cache_loc=swa_out_cache_loc,
+                decode_page_table_5d=decode_page_table_5d,
             )
 
         elif forward_batch.forward_mode.is_draft_extend_v2():
@@ -1435,10 +1484,12 @@ class AiterAttnBackend(AttentionBackend):
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
 
-        if self.use_triton_unified_attention:
+        if self.use_triton_unified_attention or self.kv_cache_is_vectorized_5d:
             # Keep a distinct page-table buffer for unified attention.  Sharing
             # cuda_graph_kv_indices with non-unified token indices makes
             # page-table width ambiguous after the token buffer is expanded.
+            # MiniMax-M3 SHUFFLE-5D dense decode also uses unified_attention and
+            # needs this 2D block-level page table under cuda graph.
             max_num_blocks_per_seq = (
                 self.max_context_len + self.page_size - 1
             ) // self.page_size
@@ -1531,6 +1582,7 @@ class AiterAttnBackend(AttentionBackend):
             qo_indptr = None
             kv_last_page_len = None
             max_q_len = None
+            decode_page_table_5d = None
 
             if spec_info is None or (
                 self.use_triton_unified_attention and not self.use_mla
@@ -1553,6 +1605,20 @@ class AiterAttnBackend(AttentionBackend):
                         kv_indices,
                         self.req_to_token.stride(0),
                     )
+                    if self.kv_cache_is_vectorized_5d:
+                        # MiniMax-M3 dense decode (unified_attention over SHUFFLE-5D)
+                        # needs a 2D block-level page table in a PERSISTENT buffer so
+                        # cuda-graph replay reads the in-place-updated indices. Fill
+                        # cuda_graph_page_table[:bs] = req_to_token pages // page_size.
+                        page_indices = self.req_to_token[
+                            req_pool_indices[:bs], :max_kv_len
+                        ]
+                        if self.page_size > 1:
+                            page_indices = self._transform_table_1_to_real(page_indices)
+                        nr, nc = page_indices.shape
+                        self.cuda_graph_page_table[:nr, :nc].copy_(page_indices)
+                        decode_page_table_5d = self.cuda_graph_page_table
+                        qo_indptr = self.qo_indptr_unified_decode[: bs + 1]
                 else:
                     max_q_len = 1
                     kv_indices = self.cuda_graph_page_table
@@ -1654,6 +1720,7 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map=reduce_partial_map,
                 num_kv_splits=num_kv_splits,
                 swa_page_table=swa_page_table,
+                decode_page_table_5d=decode_page_table_5d,
                 # num_kv_splits_indptr=num_kv_splits_indptr,
             )
 
