@@ -241,18 +241,24 @@ def atom_gluon_sparse_prefill(
     out = torch.empty_like(q)
     num_seqs = total_q
     ctx_part = 256
-    # pa_decode_gluon launches exactly max_part_num partitions of ctx_part tokens
-    # each, with no inner loop over partitions, so it covers only
-    # max_part_num * ctx_part tokens. get_recommended_splits is a parallelism hint
-    # (min(cdiv(num_sm, num_seqs), 8)); when num_seqs is large (e.g. a 16k-token
-    # prefill chunk) it collapses to 1 -> only 256 tokens covered. Under a radix
-    # cache hit each query's causal range spans the whole cached prefix, so the
-    # per-query effective KV length (sparse_ctx, up to topk*block = 2048) exceeds
-    # that coverage -> the kernel indexes past the block table -> HIP illegal
-    # memory access. Size max_part_num to cover the longest sparse_ctx.
+    # max_context_partition_num is a PARALLELISM/split knob, not a coverage
+    # requirement: the gluon kernel loops over the full context internally, so a
+    # single partition still attends the whole sparse_ctx. Verified with a
+    # standalone mini-bench -- max_part=1 matches full-coverage output at
+    # ctx=2048 and 4096 (rel diff = bf16 noise, no OOB/crash). ATOM sizes it with
+    # get_recommended_splits alone. An earlier needed_parts floor
+    # (ceil(max_sparse_ctx/256), up to 8) over-split large-ctx chunked-prefill
+    # batches, adding ~400us of empty-partition launch overhead per extra split
+    # (3433us vs 1013us/launch at num_seqs=16384). Match ATOM: rec_splits only.
+    # Escape hatch: SGLANG_M3_PA_NEEDED_PARTS=1 restores the old floor.
     max_ctx = int(sparse_ctx.max().item()) if sparse_ctx.numel() else 0
     needed_parts = max(1, (max_ctx + ctx_part - 1) // ctx_part)
-    max_part_num = max(get_recommended_splits(num_seqs, 1), needed_parts)
+    import os as _os_par
+
+    if _os_par.environ.get("SGLANG_M3_PA_NEEDED_PARTS", "0") == "1":
+        max_part_num = max(get_recommended_splits(num_seqs, 1), needed_parts)
+    else:
+        max_part_num = get_recommended_splits(num_seqs, 1)
     intermediate_shape = (num_seqs, 1, max_part_num, num_q_heads)
     exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
     max_logits = torch.empty_like(exp_sums)
