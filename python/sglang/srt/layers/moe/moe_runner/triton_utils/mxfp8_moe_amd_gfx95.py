@@ -280,7 +280,12 @@ def fused_moe_mxfp8_native(
         topk_ids = topk_ids.to(torch.int32, copy=True)
         topk_ids.masked_fill_((topk_ids < 0) | (topk_ids >= local_num_experts), -1)
 
-    block_m = 64
+    # block_m drives both the moe_align padding and the grouped-GEMM tiling.
+    # Mini-bench on M3 expert shapes (E=128, inter=384, H=6144, gfx950): block_m=128
+    # beats 64 on both GEMMs once the routed problem is large (gemm1 T=2048: 284->239us;
+    # gemm2 large T similar), while small T prefers 64 (less align padding). Gate on
+    # the routed token count M = T*top_k; crossover ~M=4096 (T~1024).
+    block_m = 128 if T * top_k >= 4096 else 64
     sorted_ids, expert_ids, num_post = moe_align_block_size(
         topk_ids, block_m, local_num_experts
     )
