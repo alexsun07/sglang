@@ -225,11 +225,19 @@ def _run_mxfp8_linear_kernel(
     M, K = x_q.shape
     N = w.shape[0]
     out = torch.empty((M, N), dtype=out_dtype, device=x_q.device)
-    BLOCK_M, BLOCK_K = 64, 128
-    if M <= 512 and (K >= 4096 or (N == 6144 and K in (2048, 3072))):
-        BLOCK_N, num_warps = 64, 4
+    # Block config picked by mini-bench sweep on M3 dense shapes (gfx950).
+    # Large M (prefill chunks): BLOCK_M=128 roughly doubles occupancy vs 64 and
+    # is ~1.5-1.7x faster (e.g. gate_up M=8192 N=K=6144: 791us@BM64 -> 506us@BM128).
+    # Small M (decode / tiny batch): BLOCK_M=64 stays better (BM128 wastes rows).
+    # Crossover measured near M~1024.
+    if M >= 1024:
+        BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 128, 128, 8
     else:
-        BLOCK_N, num_warps = 128, 8
+        BLOCK_M, BLOCK_K = 64, 128
+        if M <= 512 and (K >= 4096 or (N == 6144 and K in (2048, 3072))):
+            BLOCK_N, num_warps = 64, 4
+        else:
+            BLOCK_N, num_warps = 128, 8
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     _mxfp8_linear_kernel[grid](
         x_q,
