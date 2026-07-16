@@ -119,6 +119,15 @@ _is_gfx95_supported = is_gfx95_supported()
 _mxfp8_to_block_fp8_required = mxfp8_block_convert_required()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
+# MiniMax-M3: opt-in to convert dense/attention linears from MXFP8 (1x32 block)
+# to per-token-per-channel (ptpc) FP8 at load time and run aiter's CK a8w8
+# gemm_a8w8_bpreshuffle at inference, matching ATOM's ptpc_fp8 recipe. The dense
+# GEMM alone is ~1.35-1.46x faster than the triton mxfp8 dot_scaled path
+# (mini-benched); at e2e it is only ~1.5% on the 90%-cache-hit prefill workload
+# because the dense linear is a small fraction there (MoE + comm dominate). Kept
+# as an opt-in since it is correct (GSM8K unchanged) and aligns with ATOM.
+# MoE stays MXFP8 (it uses a different quant method).
+_m3_ptpc_dense = get_bool_env_var("SGLANG_M3_PTPC_DENSE") and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 
 
@@ -712,7 +721,35 @@ class Fp8LinearMethod(LinearMethodBase):
             copy_or_rebind_param(layer, "weight_scale_inv_deepgemm", scale_packed)
         else:
             # Triton path consumes canonical 2D UE8M0 uint8 scales directly.
+            if _m3_ptpc_dense:
+                self._convert_mxfp8_linear_to_ptpc(layer)
             return
+
+    def _convert_mxfp8_linear_to_ptpc(self, layer: Module) -> None:
+        """MiniMax-M3 dense/attention linear: MXFP8 (1x32) -> per-token-per-channel
+        FP8, run via aiter gemm_a8w8_bpreshuffle (ATOM ptpc_fp8 recipe). MoE is a
+        different quant method and is unaffected (stays MXFP8), matching ATOM's
+        `*block_sparse_moe` exclusion."""
+        import aiter
+        from aiter import get_hip_quant
+
+        from sglang.srt.layers.quantization.mxfp8_amd_gfx95 import (
+            dequant_mxfp8_to_bf16,
+        )
+
+        w_fp8 = layer.weight.data  # [N, K] e4m3fn
+        scale_u8 = layer.weight_scale_inv.data  # [N, K//32] UE8M0
+        w_bf16 = dequant_mxfp8_to_bf16(w_fp8, scale_u8)  # [N, K] bf16
+
+        # Per-channel (per-row) FP8 quant of the weight -> [N,1] fp32 scale.
+        per_token_quant = get_hip_quant(aiter.QuantType.per_Token)
+        w_q, w_scale = per_token_quant(w_bf16, quant_dtype=aiter.dtypes.fp8)
+        # Preshuffle once so the CK a8w8 kernel reads the tuned layout.
+        w_q = shuffle_weight(w_q.contiguous(), (16, 16))
+
+        copy_or_rebind_param(layer, "weight", w_q)
+        copy_or_rebind_param(layer, "weight_scale", w_scale.contiguous())
+        layer._m3_ptpc = True
 
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
@@ -858,6 +895,17 @@ class Fp8LinearMethod(LinearMethodBase):
                 workspace=layer.workspace,
                 size_n=layer.output_size_per_partition,
                 size_k=layer.input_size_per_partition,
+                bias=bias,
+            )
+
+        if getattr(layer, "_m3_ptpc", False):
+            # MiniMax-M3 dense/attn linear converted to ptpc FP8 at load time.
+            from sglang.srt.layers.quantization.fp8_utils import apply_fp8_ptpc_linear
+
+            return apply_fp8_ptpc_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
                 bias=bias,
             )
 
