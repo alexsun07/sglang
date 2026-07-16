@@ -128,6 +128,13 @@ _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 # as an opt-in since it is correct (GSM8K unchanged) and aligns with ATOM.
 # MoE stays MXFP8 (it uses a different quant method).
 _m3_ptpc_dense = get_bool_env_var("SGLANG_M3_PTPC_DENSE") and _is_hip
+# MiniMax-M3: opt-in to run the MXFP8 (1x32) MoE experts through aiter's fused
+# 2-stage grouped GEMM (mfma_moe1_silu_mul_afp8_wfp8 + mfma_moe2) instead of the
+# triton grouped_gemm+swiglu_quant path, matching ATOM's MoE. Needs the aiter
+# gate/up-interleaved weight+scale shuffle at load (see _process_mxfp8_moe_weights)
+# and quant_type=PER_1X32 in the aiter runner. MoE is the largest remaining
+# per-forward gap vs ATOM.
+_m3_moe_aiter = get_bool_env_var("SGLANG_M3_MOE_AITER") and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 
 
@@ -1883,6 +1890,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
+        if _m3_moe_aiter and _is_hip and get_moe_runner_backend().is_aiter():
+            # Shuffle MXFP8 experts into the gate/up-interleaved layout aiter's
+            # fused 2-stage grouped GEMM expects (mirrors ATOM Fp8MoEMethod
+            # per_1x32 and SGLang's own FP4 MoE branch). shuffle_scale consumes a
+            # 2D [E*rows, K//32] view and returns the per-expert shuffled scale.
+            gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+            for name, is_w13 in (("w13", True), ("w2", False)):
+                w = getattr(layer, f"{name}_weight")
+                s = getattr(layer, f"{name}_weight_scale_inv")
+                num_experts = w.shape[0]
+                w.data = shuffle_weight(w, is_guinterleave=gu_intv, gate_up=is_w13)
+                s.data = shuffle_scale(
+                    s.reshape(-1, s.shape[-1]), num_experts, gu_intv, is_w13
+                )
+                w.is_shuffled = True
+            return
+
         if (
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -2454,9 +2478,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         w2_weight = layer.w2_weight
 
         if self.block_quant:
+            # MXFP8 (1x32) experts and FP4 both map to PER_1X32; dense fp8 block
+            # scale is PER_128X128.
+            use_rocm_mxfp8 = self.use_mxfp8 and _is_gfx95_supported
             quant_type = (
                 AiterQuantType.PER_1X32
-                if self.is_fp4_expert
+                if (self.is_fp4_expert or use_rocm_mxfp8)
                 else AiterQuantType.PER_128X128
             )
 
@@ -2467,6 +2494,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 if getattr(layer.w13_weight, "is_shuffled", False):
                     w13_weight.is_shuffled = True
                     w2_weight.is_shuffled = True
+            elif use_rocm_mxfp8 and getattr(layer.w13_weight, "is_shuffled", False):
+                # MXFP8 experts shuffled for the aiter fused 2-stage GEMM.
+                w13_weight.is_shuffled = True
+                w2_weight.is_shuffled = True
             w13_scale = layer.w13_weight_scale_inv
             w2_scale = layer.w2_weight_scale_inv
         else:

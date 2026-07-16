@@ -5361,6 +5361,9 @@ class ServerArgs:
                     "deep_gemm",
                     "flashinfer_trtllm",
                     "flashinfer_trtllm_routed",
+                    # MiniMax-M3: aiter fused 2-stage MXFP8 MoE (opt-in via
+                    # SGLANG_M3_MOE_AITER; weights get the gate/up shuffle at load).
+                    "aiter",
                 ]:
                     logger.warning(
                         "mxfp8 quantization on ROCm supports triton, cutlass, "
