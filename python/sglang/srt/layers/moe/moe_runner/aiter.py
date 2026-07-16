@@ -20,6 +20,12 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import get_bool_env_var, get_int_env_var
 
+# MiniMax-M3: the fused aiter 2-stage MoE does SwiGLU-OAI inside the kernel, so it
+# must be told activation=Swiglu + swiglu_limit (the triton path instead does a
+# separate swiglu_oai_mxfp8_quant and passes activation="silu"). Opt-in, gated by
+# the same flag as the weight shuffle in Fp8MoEMethod.
+_m3_moe_aiter = get_bool_env_var("SGLANG_M3_MOE_AITER")
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -162,7 +168,22 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
-        if quant_info.swiglu_limit > 0:
+
+        # MiniMax-M3 aiter fused MoE: the model config sets activation="silu"
+        # (for the triton path, which quantizes swiglu-oai separately); the fused
+        # 2-stage kernel instead needs activation=Swiglu + swiglu_limit so it does
+        # SwiGLU-OAI internally. Mirror ATOM's MiniMaxM3MoE(activation=Swiglu,
+        # experts.swiglu_limit=config.swiglu_limit).
+        m3_activation = None
+        m3_swiglu_limit = quant_info.swiglu_limit
+        if _m3_moe_aiter:
+            from aiter import ActivationType
+
+            m3_activation = ActivationType.Swiglu
+            if not (m3_swiglu_limit and m3_swiglu_limit > 0):
+                m3_swiglu_limit = self.config.gemm1_clamp_limit or 0.0
+
+        if (m3_swiglu_limit and m3_swiglu_limit > 0) or quant_info.swiglu_limit > 0:
             # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
             # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
             # swiglu_limit==0) still run on aiter builds where this module
@@ -179,7 +200,9 @@ class AiterRunnerCore(MoeRunnerCore):
                 if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
                 else GateMode.SEPARATED.value
             )
-            extra["swiglu_limit"] = quant_info.swiglu_limit
+            extra["swiglu_limit"] = (
+                m3_swiglu_limit if _m3_moe_aiter else quant_info.swiglu_limit
+            )
         if self.config.no_combine:
             extra["no_combine"] = True
 
@@ -190,7 +213,11 @@ class AiterRunnerCore(MoeRunnerCore):
             topk_weight=runner_input.topk_weights,
             topk_ids=runner_input.topk_ids,
             quant_type=_aiter_quant_type(runner_input.quant_type),
-            activation=_aiter_activation(self.config.activation),
+            activation=(
+                m3_activation
+                if m3_activation is not None
+                else _aiter_activation(self.config.activation)
+            ),
             w1_scale=quant_info.w13_scale,
             w2_scale=quant_info.w2_scale,
             a1_scale=a1_scale,
