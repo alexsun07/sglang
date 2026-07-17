@@ -132,6 +132,13 @@ _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
+# MiniMax-M3 shared-expert fusion on ROCm/aiter (opt-in). When on, the aiter
+# sigmoid biased-topk path appends the always-on shared expert to the routed
+# top-k so the fused MoE 2-stage kernel absorbs it (expert=n_routed+1,
+# topk+1) and dispatches to the tuned FlyDSL fp8 config. Off by default:
+# upstream sglang disables shared-expert fusion on non-CUDA devices.
+_m3_shared_fusion = get_bool_env_var("SGLANG_M3_SHARED_FUSION")
+
 # Experimental: skip the HIP padded-token routing-weight masking entirely.
 # Padded (CUDA-graph) rows are discarded downstream and the MoE combine is
 # per-token, so zeroing their weights is in principle unnecessary. Gated off by
@@ -1998,6 +2005,17 @@ def select_experts(
         # on; otherwise it falls through to fused_topk -> topk_sigmoid (the
         # historical path), keeping flag-off behavior byte-identical.
         use_jit_fused_gate = envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get()
+        # MiniMax-M3 shared-expert fusion (ROCm/aiter): the JIT fused gate does
+        # not append the aiter shared-expert column, so bypass it and fall
+        # through to fused_topk, which handles the aiter sigmoid + shared-expert
+        # append path (see the scoring_func=="sigmoid" branch in fused_topk).
+        if (
+            _use_aiter
+            and scoring_func == "sigmoid"
+            and num_fused_shared_experts > 0
+            and get_bool_env_var("SGLANG_M3_SHARED_FUSION")
+        ):
+            use_jit_fused_gate = False
         if scoring_func == "sqrtsoftplus" or (
             scoring_func == "sigmoid" and use_jit_fused_gate
         ):

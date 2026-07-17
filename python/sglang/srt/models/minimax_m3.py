@@ -88,6 +88,7 @@ from sglang.srt.models.minimax_m2 import MiniMaxM2RMSNormTP
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
+    get_bool_env_var,
     get_device_sm,
     is_cuda,
     is_hip,
@@ -99,6 +100,14 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _device_sm = get_device_sm()
+
+# MiniMax-M3 shared-expert fusion on ROCm/aiter (opt-in). Upstream sglang
+# disables shared-expert fusion on non-CUDA devices; on MI3xx the aiter fused
+# MoE 2-stage kernel *can* absorb the shared expert (matching ATOM), which is
+# required to dispatch to the tuned FlyDSL fp8 config instead of the heuristic
+# fallback. Enabling requires the aiter sigmoid biased-topk path to append the
+# shared-expert column (see topk.py SGLANG_M3_SHARED_FUSION).
+_m3_shared_fusion = get_bool_env_var("SGLANG_M3_SHARED_FUSION")
 
 # fp8 main-K/V cache dtypes (index cache always stays bf16). When the sparse
 # pool is one of these, the bf16-only qknorm+rope+kv-insert fusion is skipped so
@@ -1648,10 +1657,21 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         if get_global_server_args().disable_shared_experts_fusion:
             return
 
+        # ROCm/aiter can fuse the shared expert into the aiter 2-stage MoE
+        # kernel when SGLANG_M3_SHARED_FUSION is on (see topk.py); treat that as
+        # an accepted device just like CUDA. Read the env vars live here (not the
+        # module-level constants) so spawned TP-worker subprocesses that may not
+        # inherit the exact import-time environment still see the flag.
+        _rocm_aiter_shared_ok = (
+            _is_hip
+            and get_bool_env_var("SGLANG_M3_SHARED_FUSION")
+            and get_bool_env_var("SGLANG_USE_AITER")
+        )
+
         disable_reason = None
         if not getattr(self.config, "n_shared_experts", None):
             disable_reason = "No shared experts are defined in the config."
-        elif not _is_cuda:
+        elif not _is_cuda and not _rocm_aiter_shared_ok:
             disable_reason = "Shared experts fusion currently requires CUDA devices."
         elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             disable_reason = "Shared experts fusion requires SM80 or newer GPUs."

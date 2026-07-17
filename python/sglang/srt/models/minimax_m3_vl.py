@@ -45,13 +45,21 @@ from sglang.srt.models.minimax_vl_common import (
     merge_vit_qkv_weights,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
+from sglang.srt.utils import (
+    add_prefix,
+    get_bool_env_var,
+    get_device_sm,
+    is_cuda,
+    is_hip,
+    log_info_on_rank0,
+)
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _device_sm = get_device_sm()
 
 
@@ -144,12 +152,22 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         if server_args.disable_shared_experts_fusion:
             return
 
+        # ROCm/aiter can fuse the shared expert into the aiter 2-stage MoE
+        # kernel when SGLANG_M3_SHARED_FUSION is on (see topk.py); treat that as
+        # an accepted device just like CUDA. Read env vars live so spawned
+        # TP-worker subprocesses still see the flag.
+        _rocm_aiter_shared_ok = (
+            _is_hip
+            and get_bool_env_var("SGLANG_M3_SHARED_FUSION")
+            and get_bool_env_var("SGLANG_USE_AITER")
+        )
+
         disable_reason = None
         if not getattr(text_config, "n_shared_experts", None):
             disable_reason = "No shared experts are defined in the config."
-        elif not _is_cuda:
+        elif not _is_cuda and not _rocm_aiter_shared_ok:
             disable_reason = "Shared experts fusion currently requires CUDA devices."
-        elif (_device_sm is not None) and (_device_sm < 80):
+        elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             disable_reason = "Shared experts fusion requires SM80 or newer GPUs."
         elif get_moe_expert_parallel_world_size() > 1:
             disable_reason = (
