@@ -126,10 +126,9 @@ _has_rocm_qk_norm_rope = False
 if _is_hip:
     try:
         from sglang.jit_kernel.minimax_m3.qk_norm_rope import (
+            atom_main_norm_rope_cache,
             qk_gemma_rmsnorm_rope,
             sparse_qk_index_gemma_rmsnorm_rope,
-            sparse_qk_index_gemma_rmsnorm_rope_cache,
-            sparse_qk_index_gemma_rmsnorm_rope_cache_atom,
         )
 
         _has_rocm_qk_norm_rope = True
@@ -1086,6 +1085,7 @@ class MiniMaxM3Attention(nn.Module):
         idx_k: torch.Tensor,
         idx_v: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        fused_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         kv_pool = self._get_sparse_kv_pool()
         # The fused qknorm+rope+kv-insert kernel writes the (normed/roped) bf16
@@ -1101,15 +1101,15 @@ class MiniMaxM3Attention(nn.Module):
             if kv_pool is not None
             else None
         )
-        # The fused qknorm+rope+cache kernel supports the 5D SHUFFLE layout via a
-        # dedicated write path (opt-in): eliminates the separate D2D cache-write
-        # copy before sparse paged_attention. See qk_norm_rope.py (USE_5D).
-        _allow_5d_fusion = get_bool_env_var("SGLANG_M3_FUSED_KV_CACHE_5D")
-        layout_ok = main_kv_layout != "vectorized_5d" or _allow_5d_fusion
+        # ATOM's fused rope+cache kernels (aiter builtin for source layers,
+        # _fused_qkv_norm_rope_cache for skip layers) both write the 5D SHUFFLE
+        # cache directly, eliminating the separate D2D cache-write copy before
+        # sparse paged_attention. They require the vectorized_5d layout.
         can_use_cache_fusion = (
             not main_kv_is_fp8
-            and layout_ok
+            and main_kv_layout == "vectorized_5d"
             and idx_v is None
+            and not forward_batch.forward_mode.is_decode_or_idle()
             and self._can_use_rocm_sparse_qk_index_norm_rope(
                 positions, q, k, idx_q, idx_k
             )
@@ -1118,53 +1118,154 @@ class MiniMaxM3Attention(nn.Module):
             and v.dtype == q.dtype
             and v.shape == k.shape
         )
-        if can_use_cache_fusion and kv_pool is not None:
+        # The aiter/ATOM fused rope+cache path needs the packed [q|k|v|idx_q|idx_k]
+        # GEMM output (fused_out) for the aiter builtin and the 5D SHUFFLE cache.
+        # When the fused qkv+index GEMM is disabled (two separate GEMMs -> no
+        # packed tensor) fall back to the non-fused norm+rope path.
+        if can_use_cache_fusion and kv_pool is not None and fused_out is not None:
             layer_id = self.attn.layer_id
             k_cache, v_cache = kv_pool.get_kv_buffer(layer_id)
             idx_k_cache = kv_pool.get_index_k_buffer(layer_id)
-            # ATOM main-only skip layers: an index-topk "skip" layer reuses the
-            # group source layer's top-k in BOTH prefill and decode (decode reuse
-            # gated by SGLANG_M3_DECODE_TOPK_REUSE), so its idx_q/idx_k are never
-            # consumed and its idx_k cache is never read. Drop the index arms of
-            # the fused kernel entirely -> main-only q/k norm+rope + KV write,
-            # matching ATOM's _fused_qkv_norm_rope_cache_kernel. Only when the
-            # decode-side reuse is active (else decode reads per-layer idx_k).
+            # ATOM's two-path sparse rope+cache (matches ATOM exactly):
+            #   * SOURCE layers (compute index top-k): aiter C++/ASM builtin
+            #     fused_qknorm_idxrqknorm -- main+index norm/rope + KV cache +
+            #     index-K cache, in one call.
+            #   * SKIP layers (reuse the group source's top-k in prefill AND
+            #     decode, so idx_q/idx_k are never consumed and their idx_k cache
+            #     is never read): ATOM's main-only _fused_qkv_norm_rope_cache
+            #     kernel -- main q/k norm+rope + KV cache write, no index work.
+            # A layer is "skip" only when decode-side reuse is active (else
+            # decode reads per-layer idx_k history).
             _skip_index = False
             _sb = self._get_sparse_backend()
             if _sb is not None and getattr(_sb, "_decode_topk_reuse", False):
                 _skip_index = _sb.index_topk_skipped(
                     layer_id, self.disable_index_value
                 )
-            _fused_fn = (
-                sparse_qk_index_gemma_rmsnorm_rope_cache_atom
-                if get_bool_env_var("SGLANG_M3_FUSED_KV_CACHE_5D_ATOM")
-                else sparse_qk_index_gemma_rmsnorm_rope_cache
-            )
-            q, k, idx_q, idx_k = _fused_fn(
-                q,
-                k,
-                v,
-                idx_q,
-                idx_k,
-                k_cache,
-                v_cache,
-                idx_k_cache,
-                forward_batch.out_cache_loc,
-                self.q_norm.weight.data,
-                self.k_norm.weight.data,
-                self.index_q_norm.weight.data,
-                self.index_k_norm.weight.data,
-                positions,
-                self.rotary_emb.cos_sin_cache,
-                self.q_norm.variance_epsilon,
-                self.head_dim,
-                self.rotary_dim,
-                self.rotary_emb.is_neox_style,
-                skip_index=_skip_index,
-            )
+            if _skip_index:
+                q, k = atom_main_norm_rope_cache(
+                    q,
+                    k,
+                    v,
+                    k_cache,
+                    v_cache,
+                    forward_batch.out_cache_loc,
+                    self.q_norm.weight.data,
+                    self.k_norm.weight.data,
+                    positions,
+                    self.rotary_emb.cos_sin_cache,
+                    self.q_norm.variance_epsilon,
+                    self.head_dim,
+                    self.rotary_dim,
+                )
+            else:
+                q, idx_q = self._aiter_qknorm_idxr(
+                    fused_out,
+                    k,
+                    idx_k,
+                    k_cache,
+                    v_cache,
+                    idx_k_cache,
+                    positions,
+                    forward_batch,
+                    layer_id,
+                    mark_cached=False,
+                )
             self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
             return q, k, idx_q, idx_k
         return self._sparse_qk_index_norm_rope(positions, q, k, idx_q, idx_k)
+
+    def _aiter_qknorm_idxr(
+        self,
+        fused_out: torch.Tensor,
+        k: torch.Tensor,
+        idx_k: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        idx_k_cache: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        mark_cached: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Source-layer rope+cache via ATOM's aiter.fused_qknorm_idxrqknorm.
+
+        Consumes the packed [q|k|v|idx_q|idx_k] fused GEMM output directly
+        (zero-copy view), writes normed+roped main K/V into the 5D SHUFFLE cache
+        and index-K into the flat NHD index cache, and returns the normed+roped
+        main q / index q. k / idx_k are returned unchanged (attention reads the
+        caches; _mark_sparse_kv_cached_by_fusion makes forward_extend skip its
+        own cache write).
+        """
+        import aiter as _aiter
+
+        num_tokens = fused_out.shape[0]
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        idx_q_size = self.num_idx_heads * self.idx_head_dim
+        row = q_size + 2 * kv_size + idx_q_size + self.idx_head_dim
+        assert fused_out.is_contiguous() and fused_out.shape[1] >= row, (
+            f"aiter idxr needs a contiguous packed [q|k|v|idx_q|idx_k] row "
+            f"(>= {row}); got shape={tuple(fused_out.shape)} "
+            f"contig={fused_out.is_contiguous()}"
+        )
+        packed = fused_out[:, :row]
+
+        # cos_sin_cache must match the qkv dtype (bf16); sglang keeps it fp32
+        # until first use. Convert once and cache the bf16 buffer.
+        cos_sin = self.rotary_emb.cos_sin_cache
+        if cos_sin.dtype != packed.dtype:
+            cached = getattr(self, "_aiter_cos_sin", None)
+            if (
+                cached is None
+                or cached.dtype != packed.dtype
+                or cached.device != packed.device
+                or cached.shape != cos_sin.shape
+            ):
+                cached = cos_sin.to(device=packed.device, dtype=packed.dtype)
+                self._aiter_cos_sin = cached
+            cos_sin = cached
+
+        # Native page-64 5D SHUFFLE cache; block_size is a runtime kernel arg.
+        block_size = k_cache.shape[3]
+        idx_k_flat = idx_k_cache.reshape(-1, self.idx_head_dim)
+
+        q_out = torch.empty(
+            (num_tokens, q_size), dtype=packed.dtype, device=packed.device
+        )
+        index_q_out = torch.empty(
+            (num_tokens, idx_q_size), dtype=packed.dtype, device=packed.device
+        )
+
+        _aiter.fused_qknorm_idxrqknorm(
+            packed,
+            self.q_norm.weight.data,
+            self.k_norm.weight.data,
+            cos_sin,
+            positions,
+            self.num_heads,
+            self.num_kv_heads,
+            self.rotary_dim,
+            self.q_norm.variance_epsilon,
+            self.index_q_norm.weight.data,
+            self.index_k_norm.weight.data,
+            self.num_idx_heads,
+            forward_batch.out_cache_loc,
+            k_cache,
+            v_cache,
+            idx_k_flat,
+            block_size,
+            q_out,
+            index_q_out,
+            forward_batch.out_cache_loc,
+            kv_cache_dtype="auto",
+            k_scale=None,
+            v_scale=None,
+            asm_layout=True,
+        )
+        if mark_cached:
+            self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
+        return q_out, index_q_out
 
     def forward_prepare(
         self,
@@ -1269,7 +1370,8 @@ class MiniMaxM3Attention(nn.Module):
                 # falls back to _qk_norm_rope + _index_qk_norm_rope when
                 # preconditions fail.
                 q, k, idx_q, idx_k = self._sparse_qk_index_norm_rope_cache(
-                    positions, q, k, v, idx_q, idx_k, idx_v, forward_batch
+                    positions, q, k, v, idx_q, idx_k, idx_v, forward_batch,
+                    fused_out=fused_out,
                 )
 
             inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)
