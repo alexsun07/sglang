@@ -65,10 +65,22 @@ def minimax_sparse_prefill(
     ``seqlens_cpu`` (host copy of ``torch.diff(cu_seqlens)``) is forwarded to
     ``get_cu_seqblocks`` to avoid a per-layer device sync when it recomputes.
     """
-    if cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None:
-        cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
-            cu_seqlens, max_seqlen_q, block_size_q, block_size_k, seqlens_cpu
-        )
+    # cu_seqblocks_q/max/all are only consumed by Step 1 (the source-layer
+    # indexer, flash_prefill_with_topk_index) and the gqa-share Step-3 fallback.
+    # The 3/4 skip layers (cached_topk_idx hit) and the atom/msa Step-3 paths
+    # never use them, so compute lazily instead of every sparse layer.
+    _seqblocks_needs_compute = (
+        cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None
+    )
+
+    def _ensure_seqblocks():
+        nonlocal cu_seqblocks_q, max_seqblock_q, all_seqblock_q
+        if _seqblocks_needs_compute and cu_seqblocks_q is None:
+            cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = (
+                get_cu_seqblocks(
+                    cu_seqlens, max_seqlen_q, block_size_q, block_size_k, seqlens_cpu
+                )
+            )
 
     use_atom_env = False
     try:
@@ -78,21 +90,26 @@ def minimax_sparse_prefill(
     except Exception:
         use_atom_env = False
 
-    if use_atom_env and idx_k_cache.dim() == 5:
-        from .atom_prefill import vectorized_5d_index_cache_to_nhd
-
-        idx_k_cache = vectorized_5d_index_cache_to_nhd(idx_k_cache)
-        if idx_v_cache is not None and idx_v_cache.dim() == 5:
-            idx_v_cache = vectorized_5d_index_cache_to_nhd(idx_v_cache)
-
     # All seqlen is less than topk, use full attention
     if cached_topk_idx is not None:
         # Index cache hit: reuse a prior sparse layer's reduced top-k, skipping
         # Step 1 (flash-index attention + top-k) and Step 2 (reduce). idx_o is
-        # unused downstream for disable_index_value layers.
+        # unused downstream for disable_index_value layers. The idx_k/idx_v
+        # caches are ONLY read by Step 1, so a cache hit needs no index cache at
+        # all -> skip the SHUFFLE-5D->NHD materialization copy entirely here (it
+        # ran unconditionally every sparse layer, wasting a full index-cache D2D
+        # copy on the 3/4 skip layers).
         idx_o = None
         topk_idx = cached_topk_idx
     else:
+        if use_atom_env and idx_k_cache.dim() == 5:
+            from .atom_prefill import vectorized_5d_index_cache_to_nhd
+
+            idx_k_cache = vectorized_5d_index_cache_to_nhd(idx_k_cache)
+            if idx_v_cache is not None and idx_v_cache.dim() == 5:
+                idx_v_cache = vectorized_5d_index_cache_to_nhd(idx_v_cache)
+
+        _ensure_seqblocks()
         # Step 1: Flash attention with topk index (using index head)
         idx_o, topk_idx = flash_prefill_with_topk_index(
             q=idx_q,
@@ -184,6 +201,7 @@ def minimax_sparse_prefill(
             sm_scale=sm_scale,
         )
     else:
+        _ensure_seqblocks()
         o = flash_prefill_with_gqa_share_sparse(
             q=q,
             k_cache=k_cache,
@@ -238,6 +256,8 @@ def minimax_sparse_decode(
         torch.Tensor
     ] = None,  # per-forward MSA page table (cached)
     msa_plan=None,  # per-forward MSA fmha_sm100 plan (cached)
+    cached_topk_idx: Optional[torch.Tensor] = None,
+    return_topk_idx: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     use_atom_env = False
     try:
@@ -254,41 +274,53 @@ def minimax_sparse_decode(
         if idx_v_cache is not None and idx_v_cache.dim() == 5:
             idx_v_cache = vectorized_5d_index_cache_to_nhd(idx_v_cache)
 
-    # Step 1: Flash decode with topk index (using index head). When the dense main
-    # attention is used, the indexer emits the page table directly (fused
-    # transform) instead of block ids, plus the per-query effective KV length.
-    idx_o, topk_idx, real_seq_lens = flash_decode_with_topk_idx(
-        q=idx_q,
-        sink=idx_sink,
-        k_cache=idx_k_cache,
-        v_cache=idx_v_cache,
-        req_to_token=req_to_token,
-        seq_lens=seq_lens,
-        max_seqlen=max_seqlen,
-        slot_ids=slot_ids,
-        block_size=block_size_k,
-        topk=topk,
-        init_blocks=init_blocks,
-        local_blocks=local_blocks,
-        sm_scale=idx_sm_scale,
-        score_type=score_type,
-        disable_index_value=disable_index_value,
-        use_dense_main_attn=dense_main_attn_fn is not None,
-        page_size=page_size,
-    )
     num_idx_heads = idx_q.shape[1]
     num_kv_heads = k_cache.shape[1]
     idx_group_size = num_idx_heads // num_kv_heads
+    # Index cache (ATOM #1354) for DECODE: when cached_topk_idx is given (a skip
+    # layer of an index-topk group), reuse the group's source-layer reduced top-k
+    # and skip Step 1 (flash-index decode + top-k) and Step 2 (reduce) entirely,
+    # so the skip layer never reads idx_k_cache. Only valid for
+    # disable_index_value layers (idx_o is None there) on the non-dense-main path.
+    if cached_topk_idx is not None:
+        idx_o = None
+        real_seq_lens = None
+        topk_idx = cached_topk_idx
+    else:
+        # Step 1: Flash decode with topk index (using index head). When the dense
+        # main attention is used, the indexer emits the page table directly
+        # (fused transform) instead of block ids, plus the per-query KV length.
+        idx_o, topk_idx, real_seq_lens = flash_decode_with_topk_idx(
+            q=idx_q,
+            sink=idx_sink,
+            k_cache=idx_k_cache,
+            v_cache=idx_v_cache,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+            max_seqlen=max_seqlen,
+            slot_ids=slot_ids,
+            block_size=block_size_k,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            sm_scale=idx_sm_scale,
+            score_type=score_type,
+            disable_index_value=disable_index_value,
+            use_dense_main_attn=dense_main_attn_fn is not None,
+            page_size=page_size,
+        )
+        # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads (before caching).
+        if dense_main_attn_fn is None and idx_group_size > 1:
+            topk_idx = topk_index_reduce(
+                topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
+            )
+    # Reduced top-k to be cached by the caller for subsequent skip layers.
+    reduced_topk_idx = topk_idx
     if dense_main_attn_fn is not None:
         # topk_idx is the page table; real_seq_lens is the per-query cache_seqlens
         assert idx_group_size == 1
         o = dense_main_attn_fn(q, topk_idx, real_seq_lens)
     else:
-        # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
-        if idx_group_size > 1:
-            topk_idx = topk_index_reduce(
-                topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
-            )
         # Step 3: Sparse attention using topk index (main head). Decode stays on
         # SGLang's Triton sparse path; when the main cache is vectorized_5d (for
         # the prefill Gluon path) gather it back to NHD so that kernel can read it.
@@ -332,4 +364,6 @@ def minimax_sparse_decode(
                 topk_idx=topk_idx,
                 sm_scale=sm_scale,
             )
+    if return_topk_idx:
+        return idx_o, o, reduced_topk_idx
     return idx_o, o

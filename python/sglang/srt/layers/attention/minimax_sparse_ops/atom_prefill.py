@@ -108,6 +108,29 @@ def _build_atom_sparse_bt_prefill_kernel(
     tl.store(sparse_ctx_ptr + pid_n, ctx)
 
 
+# Per-forward reuse of (req_id, abs_pos). Both depend ONLY on cu_seqlens /
+# prefix_lens / total_q, which are identical across all ~57 sparse layers within
+# one forward (the per-layer topk_idx differs, but the token->request mapping
+# does not). Recomputing them every sparse layer added searchsorted + a few
+# copies per layer. Key on the tensor object ids + total_q: within a forward the
+# cu_seqlens/prefix_lens objects are stable, so consecutive sparse layers hit;
+# the next forward gets new objects (id changes) -> miss -> recompute. Bounded to
+# the most recent entry (LRU-1) so no unbounded growth and no stale reuse.
+_BT_META_CACHE: dict = {}
+
+# Per-group reuse of the built (sparse_bt, sparse_ctx). For the 3/4 skip layers
+# in an index-topk group, topk_idx IS the shared cached_topk_idx object (same
+# object across the group), and req_id/abs_pos are forward-invariant, so the
+# block-table kernel produces IDENTICAL output for every skip layer in the
+# group. Keying on id(topk_idx) lets the group's source layer build once (fresh
+# object -> miss) and its skip layers reuse (same object -> hit), removing the
+# per-skip-layer _build_atom_sparse_bt_prefill_kernel launch (the last kernel
+# between the fused rope+cache kernel and paged_attention). LRU-1: layers run in
+# order (source, skip, skip, ... then next group's source), so one entry covers
+# a whole group and the next source evicts it -- no stale reuse, no growth.
+_BT_OUT_CACHE: dict = {}
+
+
 def _build_atom_sparse_bt_prefill(
     topk_idx: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -121,11 +144,24 @@ def _build_atom_sparse_bt_prefill(
     total_q = topk_idx.shape[1]
     topk = topk_idx.shape[2]
     pages_per_block = sparse_block_size // page_size
-    pos = torch.arange(total_q, dtype=torch.int32, device=topk_idx.device)
-    req_id = torch.searchsorted(cu_seqlens[1:].contiguous(), pos, right=True).to(
-        torch.int32
-    )
-    abs_pos = (prefix_lens[req_id] + (pos - cu_seqlens[req_id])).to(torch.int32)
+
+    out_key = (id(topk_idx), total_q, topk, sparse_block_size, page_size)
+    out_cached = _BT_OUT_CACHE.get(out_key)
+    if out_cached is not None:
+        return out_cached
+
+    cache_key = (id(cu_seqlens), id(prefix_lens), total_q)
+    cached = _BT_META_CACHE.get(cache_key)
+    if cached is not None:
+        req_id, abs_pos = cached
+    else:
+        pos = torch.arange(total_q, dtype=torch.int32, device=topk_idx.device)
+        req_id = torch.searchsorted(cu_seqlens[1:].contiguous(), pos, right=True).to(
+            torch.int32
+        )
+        abs_pos = (prefix_lens[req_id] + (pos - cu_seqlens[req_id])).to(torch.int32)
+        _BT_META_CACHE.clear()  # LRU-1: only keep the current forward's mapping
+        _BT_META_CACHE[cache_key] = (req_id, abs_pos)
 
     sparse_bt = torch.empty(
         (total_q, topk * pages_per_block),
@@ -151,6 +187,8 @@ def _build_atom_sparse_bt_prefill(
         pages_per_block=pages_per_block,
         BLOCK_SIZE_T=triton.next_power_of_2(topk),
     )
+    _BT_OUT_CACHE.clear()  # LRU-1: only the current group's block table
+    _BT_OUT_CACHE[out_key] = (sparse_bt, sparse_ctx)
     return sparse_bt, sparse_ctx
 
 
@@ -251,11 +289,14 @@ def atom_gluon_sparse_prefill(
     # batches, adding ~400us of empty-partition launch overhead per extra split
     # (3433us vs 1013us/launch at num_seqs=16384). Match ATOM: rec_splits only.
     # Escape hatch: SGLANG_M3_PA_NEEDED_PARTS=1 restores the old floor.
-    max_ctx = int(sparse_ctx.max().item()) if sparse_ctx.numel() else 0
-    needed_parts = max(1, (max_ctx + ctx_part - 1) // ctx_part)
     import os as _os_par
 
     if _os_par.environ.get("SGLANG_M3_PA_NEEDED_PARTS", "0") == "1":
+        # Only the escape-hatch path needs the max sparse context, which requires
+        # a GPU->CPU sync (.item()). The default path uses get_recommended_splits
+        # alone, so skip the sync entirely there (it ran once per sparse layer).
+        max_ctx = int(sparse_ctx.max().item()) if sparse_ctx.numel() else 0
+        needed_parts = max(1, (max_ctx + ctx_part - 1) // ctx_part)
         max_part_num = max(get_recommended_splits(num_seqs, 1), needed_parts)
     else:
         max_part_num = get_recommended_splits(num_seqs, 1)

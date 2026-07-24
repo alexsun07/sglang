@@ -129,6 +129,7 @@ if _is_hip:
             qk_gemma_rmsnorm_rope,
             sparse_qk_index_gemma_rmsnorm_rope,
             sparse_qk_index_gemma_rmsnorm_rope_cache,
+            sparse_qk_index_gemma_rmsnorm_rope_cache_atom,
         )
 
         _has_rocm_qk_norm_rope = True
@@ -1068,6 +1069,13 @@ class MiniMaxM3Attention(nn.Module):
         sparse_backend = getattr(attn_backend, "sparse", None)
         return getattr(sparse_backend, "kv_pool", None)
 
+    @staticmethod
+    def _get_sparse_backend():
+        if not has_forward_context():
+            return None
+        attn_backend = get_forward_context().attn_backend
+        return getattr(attn_backend, "sparse", None)
+
     def _sparse_qk_index_norm_rope_cache(
         self,
         positions: torch.Tensor,
@@ -1093,9 +1101,14 @@ class MiniMaxM3Attention(nn.Module):
             if kv_pool is not None
             else None
         )
+        # The fused qknorm+rope+cache kernel supports the 5D SHUFFLE layout via a
+        # dedicated write path (opt-in): eliminates the separate D2D cache-write
+        # copy before sparse paged_attention. See qk_norm_rope.py (USE_5D).
+        _allow_5d_fusion = get_bool_env_var("SGLANG_M3_FUSED_KV_CACHE_5D")
+        layout_ok = main_kv_layout != "vectorized_5d" or _allow_5d_fusion
         can_use_cache_fusion = (
             not main_kv_is_fp8
-            and main_kv_layout != "vectorized_5d"
+            and layout_ok
             and idx_v is None
             and self._can_use_rocm_sparse_qk_index_norm_rope(
                 positions, q, k, idx_q, idx_k
@@ -1109,7 +1122,25 @@ class MiniMaxM3Attention(nn.Module):
             layer_id = self.attn.layer_id
             k_cache, v_cache = kv_pool.get_kv_buffer(layer_id)
             idx_k_cache = kv_pool.get_index_k_buffer(layer_id)
-            q, k, idx_q, idx_k = sparse_qk_index_gemma_rmsnorm_rope_cache(
+            # ATOM main-only skip layers: an index-topk "skip" layer reuses the
+            # group source layer's top-k in BOTH prefill and decode (decode reuse
+            # gated by SGLANG_M3_DECODE_TOPK_REUSE), so its idx_q/idx_k are never
+            # consumed and its idx_k cache is never read. Drop the index arms of
+            # the fused kernel entirely -> main-only q/k norm+rope + KV write,
+            # matching ATOM's _fused_qkv_norm_rope_cache_kernel. Only when the
+            # decode-side reuse is active (else decode reads per-layer idx_k).
+            _skip_index = False
+            _sb = self._get_sparse_backend()
+            if _sb is not None and getattr(_sb, "_decode_topk_reuse", False):
+                _skip_index = _sb.index_topk_skipped(
+                    layer_id, self.disable_index_value
+                )
+            _fused_fn = (
+                sparse_qk_index_gemma_rmsnorm_rope_cache_atom
+                if get_bool_env_var("SGLANG_M3_FUSED_KV_CACHE_5D_ATOM")
+                else sparse_qk_index_gemma_rmsnorm_rope_cache
+            )
+            q, k, idx_q, idx_k = _fused_fn(
                 q,
                 k,
                 v,
@@ -1129,6 +1160,7 @@ class MiniMaxM3Attention(nn.Module):
                 self.head_dim,
                 self.rotary_dim,
                 self.rotary_emb.is_neox_style,
+                skip_index=_skip_index,
             )
             self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
             return q, k, idx_q, idx_k

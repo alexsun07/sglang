@@ -184,6 +184,34 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._topk_is_source[lid] = (ordinal % self.index_topk_freq) == 0
         # Per-forward cache {group_key: reduced_topk_idx}; cleared each forward.
         self._topk_cache: dict = {}
+        # Per-forward cache of the layer-invariant sparse metadata
+        # (cu_seqlens/seq_lens/prefix_lens). These derive only from
+        # forward_batch and are identical across all 57 sparse layers, but were
+        # rebuilt (torch.cat + cumsum + .to) every layer, spawning ~half the
+        # glue kernels between rope+cache and PA AND breaking the downstream
+        # _BT_META_CACHE (which keys on id(cu_seqlens)/id(prefix_lens): fresh
+        # objects every layer -> never hit -> searchsorted/arange recomputed
+        # per layer). Cache keyed on id(extend_seq_lens) (stable within a
+        # forward, new each forward). LRU-1.
+        self._sparse_meta_cache: dict = {}
+
+        # DECODE index-topk reuse (ATOM #1354 extended to decode). Mirrors the
+        # prefill _topk_cache, but decode runs under CUDA graph so the reused
+        # top-k must live in a PERSISTENT per-batch-size DEVICE buffer (a host
+        # dict is not graph-safe -- same reason MSA decode uses _msa_cg). Within
+        # a decode step the group's source layer writes its reduced top-k into
+        # the buffer (device copy_, graph-safe) and the group's skip layers read
+        # it, skipping their own flash-index decode + top-k. Keyed by (group,bs);
+        # the buffer address is fixed across replays. Only active when
+        # index_cache_enabled (freq>1). Allocated lazily on first decode of a bs.
+        self._decode_topk_buf: dict = {}
+        # Decode topk reuse defaults ON (ATOM behavior). Set
+        # SGLANG_M3_DECODE_TOPK_REUSE=0 to disable (e.g. to A/B the accuracy cost).
+        import os as _os_dtr
+
+        self._decode_topk_reuse = _os_dtr.environ.get(
+            "SGLANG_M3_DECODE_TOPK_REUSE", "1"
+        ) not in ("0", "false", "False")
 
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
@@ -223,6 +251,23 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # captured graph reads. Skipped when the dense-sparse-decode path owns decode.
         if self._msa_owns_decode and forward_batch.forward_mode.is_decode_or_idle():
             self._prepare_msa_decode_meta(forward_batch)
+
+        # Ensure the persistent per-bs decode index-topk reuse buffer exists
+        # (allocated eager, outside capture; forward_decode only copies into /
+        # reads from it during the captured graph). Shape (num_kv_heads, bs,
+        # topk) matches the reduced decode top-k. num_kv_heads == 1 for M3.
+        if (
+            self.index_cache_enabled
+            and forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            bs = forward_batch.seq_lens.shape[0]
+            if bs > 0 and bs not in self._decode_topk_buf:
+                _nkv = self.kv_pool.main_pool.head_num  # == runtime k_cache.shape[1]
+                self._decode_topk_buf[bs] = torch.empty(
+                    (_nkv, bs, self.topk_blocks),
+                    dtype=torch.int32,
+                    device=forward_batch.seq_lens.device,
+                )
 
     def _prepare_msa_decode_meta(self, forward_batch: ForwardBatch):
         """Refresh the persistent per-batch-size MSA decode plan + page table in place."""
@@ -353,19 +398,32 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
-        cu_seqlens = torch.cat(
-            [
-                torch.zeros(
-                    1, dtype=torch.int32, device=forward_batch.extend_seq_lens.device
-                ),
-                forward_batch.extend_seq_lens.to(torch.int32).cumsum(0).to(torch.int32),
-            ]
-        )
-        seq_lens = forward_batch.seq_lens.to(torch.int32)  # prefix + extend
-        if forward_batch.extend_prefix_lens is not None:
-            prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
+        # cu_seqlens/seq_lens/prefix_lens are layer-invariant within a forward;
+        # build once and reuse across all sparse layers (see _sparse_meta_cache).
+        _meta_key = (id(forward_batch.extend_seq_lens), id(forward_batch.seq_lens))
+        _meta = self._sparse_meta_cache.get(_meta_key)
+        if _meta is None:
+            cu_seqlens = torch.cat(
+                [
+                    torch.zeros(
+                        1,
+                        dtype=torch.int32,
+                        device=forward_batch.extend_seq_lens.device,
+                    ),
+                    forward_batch.extend_seq_lens.to(torch.int32)
+                    .cumsum(0)
+                    .to(torch.int32),
+                ]
+            )
+            seq_lens = forward_batch.seq_lens.to(torch.int32)  # prefix + extend
+            if forward_batch.extend_prefix_lens is not None:
+                prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
+            else:
+                prefix_lens = torch.zeros_like(seq_lens)
+            self._sparse_meta_cache.clear()  # LRU-1: only the current forward
+            self._sparse_meta_cache[_meta_key] = (cu_seqlens, seq_lens, prefix_lens)
         else:
-            prefix_lens = torch.zeros_like(seq_lens)
+            cu_seqlens, seq_lens, prefix_lens = _meta
 
         # In DP attention mode, q may be padded beyond the actual token count
         # for collective communication alignment. Trim to actual tokens so
@@ -549,7 +607,29 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     "did not prepare the plan for this forward (gate mismatch)."
                 )
 
-        idx_o, o = minimax_sparse_decode(
+        # Decode index-topk group reuse (ATOM #1354 for decode): a group's source
+        # layer computes+stores its reduced top-k into the persistent per-bs
+        # device buffer; the group's skip layers reuse it and never run their own
+        # flash-index decode / top-k (so they don't read idx_k_cache). Only for
+        # disable_value layers on the non-dense-main sparse path. All device ops
+        # (copy_ / read) so it is CUDA-graph safe. Mirrors the prefill _topk_cache.
+        _use_topk_reuse = (
+            self._decode_topk_reuse
+            and self.index_cache_enabled
+            and disable_value
+            and attn_fn is None
+        )
+        _bs = q.shape[0]
+        _topk_buf = self._decode_topk_buf.get(_bs) if _use_topk_reuse else None
+        _cached_topk = None
+        _want_topk = False
+        if _use_topk_reuse and _topk_buf is not None:
+            if self._topk_is_source.get(layer.layer_id, True):
+                _want_topk = True  # compute and store for this group's skips
+            else:
+                _cached_topk = _topk_buf  # reuse the source layer's stored top-k
+
+        result = minimax_sparse_decode(
             q,
             None,
             k_cache,
@@ -574,7 +654,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             use_msa=self._use_msa_decode,
             msa_kv_indices=msa_kv_indices,
             msa_plan=msa_plan,
+            cached_topk_idx=_cached_topk,
+            return_topk_idx=_want_topk,
         )
+        if _want_topk:
+            idx_o, o, reduced_topk_idx = result
+            # Store into the persistent buffer (device copy_) for this group's
+            # subsequent skip layers to read within this same decode step.
+            _topk_buf.copy_(reduced_topk_idx)
+        else:
+            idx_o, o = result
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
             o.reshape(q.shape[0], -1).contiguous(),
