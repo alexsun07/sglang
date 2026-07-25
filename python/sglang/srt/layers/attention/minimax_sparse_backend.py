@@ -12,6 +12,9 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_score_type,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.minimax_sparse_ops.common.utils import (
+    get_cu_seqblocks,
+)
 from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
     minimax_sparse_decode,
     minimax_sparse_prefill,
@@ -420,10 +423,40 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 prefix_lens = forward_batch.extend_prefix_lens.to(torch.int32)
             else:
                 prefix_lens = torch.zeros_like(seq_lens)
+            # cu_seqblocks_q/max/all are also layer-invariant (depend only on
+            # cu_seqlens + block sizes). The source layers' indexer
+            # (flash_prefill_with_topk_index) recomputes them via get_cu_seqblocks
+            # every source layer -> ~8 tiny fill/cumsum/slice glue kernels between
+            # the fused rope+cache kernel and the indexer. Build once per forward
+            # here and pass them down (matches ATOM, which precomputes the block
+            # metadata once). seqlens_cpu avoids the .item() device sync.
+            cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = (
+                get_cu_seqblocks(
+                    cu_seqlens,
+                    self._max_seqlen_q,
+                    self.block_size_q,
+                    self.block_size_k,
+                    forward_batch.extend_seq_lens_cpu,
+                )
+            )
             self._sparse_meta_cache.clear()  # LRU-1: only the current forward
-            self._sparse_meta_cache[_meta_key] = (cu_seqlens, seq_lens, prefix_lens)
+            self._sparse_meta_cache[_meta_key] = (
+                cu_seqlens,
+                seq_lens,
+                prefix_lens,
+                cu_seqblocks_q,
+                max_seqblock_q,
+                all_seqblock_q,
+            )
         else:
-            cu_seqlens, seq_lens, prefix_lens = _meta
+            (
+                cu_seqlens,
+                seq_lens,
+                prefix_lens,
+                cu_seqblocks_q,
+                max_seqblock_q,
+                all_seqblock_q,
+            ) = _meta
 
         # In DP attention mode, q may be padded beyond the actual token count
         # for collective communication alignment. Trim to actual tokens so
@@ -484,6 +517,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             use_msa=self.use_msa,
             # Host seq-lens let get_cu_seqblocks avoid a per-layer .item() sync.
             seqlens_cpu=forward_batch.extend_seq_lens_cpu,
+            # Precomputed once per forward (see _sparse_meta_cache) -> the
+            # source-layer indexer no longer recomputes them per layer.
+            cu_seqblocks_q=cu_seqblocks_q,
+            max_seqblock_q=max_seqblock_q,
+            all_seqblock_q=all_seqblock_q,
             cached_topk_idx=cached_topk_idx,
             return_topk_idx=want_topk,
         )
