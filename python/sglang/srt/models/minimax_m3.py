@@ -1075,6 +1075,77 @@ class MiniMaxM3Attention(nn.Module):
         attn_backend = get_forward_context().attn_backend
         return getattr(attn_backend, "sparse", None)
 
+    @staticmethod
+    def _get_dense_kv_pool():
+        # DENSE (full-attention) layers use the main token_to_kv_pool, held by
+        # the hybrid backend's dense sub-backend.
+        if not has_forward_context():
+            return None
+        attn_backend = get_forward_context().attn_backend
+        dense_backend = getattr(attn_backend, "dense", None)
+        return getattr(dense_backend, "token_to_kv_pool", None)
+
+    def _dense_norm_rope_cache(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
+        """Dense-layer fused GemmaRMSNorm+RoPE + 5D SHUFFLE KV-cache write.
+
+        Matches ATOM: one _fused_qkv_norm_rope_cache kernel instead of sglang's
+        separate _qk_gemma_rmsnorm_rope + reshape_and_cache_shuffle_5d. Returns
+        (q_roped, k_roped, wrote_cache). When wrote_cache is True the caller must
+        pass save_kv_cache=False to self.attn so the backend does not re-write.
+        Falls back (wrote_cache=False) to the plain norm+rope path when the
+        preconditions (per-head Gemma norm, vectorized_5d bf16 cache, extend) do
+        not hold.
+        """
+        kv_pool = self._get_dense_kv_pool()
+        main_pool = getattr(kv_pool, "main_pool", None) or kv_pool
+        main_kv_layout = getattr(main_pool, "kv_cache_layout", None)
+        main_kv_is_fp8 = kv_pool is not None and getattr(
+            kv_pool, "dtype", None
+        ) in _FP8_KV_DTYPES
+        can_fuse = (
+            kv_pool is not None
+            and not main_kv_is_fp8
+            and main_kv_layout == "vectorized_5d"
+            and self._can_use_rocm_qk_norm_rope(positions, q, k)
+            and getattr(forward_batch, "out_cache_loc", None) is not None
+            and not forward_batch.forward_mode.is_decode_or_idle()
+            and v.dim() == 2
+            and v.dtype == q.dtype
+            and v.shape == k.shape
+        )
+        if not can_fuse:
+            q, k = self._qk_norm_rope(positions, q, k)
+            return q, k, False
+
+        layer_id = self.attn.layer_id
+        k_cache, v_cache = kv_pool.get_kv_buffer(layer_id)
+        if k_cache.dim() != 5 or v_cache.dim() != 5:
+            q, k = self._qk_norm_rope(positions, q, k)
+            return q, k, False
+        q, k = atom_main_norm_rope_cache(
+            q,
+            k,
+            v,
+            k_cache,
+            v_cache,
+            forward_batch.out_cache_loc,
+            self.q_norm.weight.data,
+            self.k_norm.weight.data,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            self.q_norm.variance_epsilon,
+            self.head_dim,
+            self.rotary_dim,
+        )
+        return q, k, True
+
     def _sparse_qk_index_norm_rope_cache(
         self,
         positions: torch.Tensor,
@@ -1376,9 +1447,15 @@ class MiniMaxM3Attention(nn.Module):
 
             inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)
         else:
+            dense_kv_written = False
             if not main_qk_already_normed:
-                q, k = self._qk_norm_rope(positions, q, k)
-            inner_state = (q, k, v, forward_batch)
+                # Fused norm+rope + 5D KV-cache write in one kernel (ATOM-style)
+                # when possible; else plain norm+rope. wrote_cache tells
+                # forward_core whether to skip the backend's own KV write.
+                q, k, dense_kv_written = self._dense_norm_rope_cache(
+                    positions, q, k, v, forward_batch
+                )
+            inner_state = (q, k, v, forward_batch, dense_kv_written)
         return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
@@ -1415,8 +1492,12 @@ class MiniMaxM3Attention(nn.Module):
             idx_output, _ = self.index_o_proj(idx_o)
             return output + idx_output
 
-        q, k, v, forward_batch = inner_state
-        attn_output = self.attn(q, k, v, forward_batch)
+        q, k, v, forward_batch, dense_kv_written = inner_state
+        # If _dense_norm_rope_cache already wrote the KV cache in the fused
+        # kernel, tell the backend not to write it again.
+        attn_output = self.attn(
+            q, k, v, forward_batch, save_kv_cache=not dense_kv_written
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
