@@ -413,6 +413,121 @@ def _topk_index_kernel(
     tl.store(ti_ptrs, topk_idx.to(ti_ptrs.dtype.element_ty), mask=topk_mask)
 
 
+@triton.heuristics(
+    {"BLOCK_SIZE_KD": lambda args: triton.next_power_of_2(args["qk_head_dim"])}
+)
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE_Q": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE_Q": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE_Q": 64}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_Q": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_Q": 128}, num_warps=8, num_stages=3),
+    ],
+    key=["qk_head_dim", "block_size"],
+)
+@triton.jit
+def _index_block_score_only_kernel(
+    q_ptr,  # Q: [total_q, h, d]
+    k_cache_ptr,  # K paged: [max_slots, kh, d]
+    score_ptr,  # Score: [h, total_q, max_seqblock]
+    req_to_token_ptr,  # [max_reqs, max_kv_len]
+    cu_seqlens,
+    seq_lens,
+    prefix_lens,
+    slot_ids,
+    max_slots,
+    num_heads,
+    gqa_group_size,
+    qk_head_dim,
+    sm_scale,
+    stride_q_n,
+    stride_q_h,
+    stride_q_d,
+    stride_k_s,
+    stride_k_h,
+    stride_k_d,
+    stride_s_h,
+    stride_s_q,
+    stride_s_k,
+    stride_r2t_b,
+    BLOCK_SIZE_Q: tl.constexpr,
+    block_size: tl.constexpr,  # sparse K block size (== 128)
+    BLOCK_SIZE_KD: tl.constexpr,
+):
+    """Score-only variant of the index attention (ATOM-style).
+
+    Computes, per (query token, KV block), the causal max of idx_q . index_k --
+    the block scores the top-k selection needs -- WITHOUT the index-value
+    attention output (idx_o). Used for disable_index_value source layers, where
+    idx_o is unused. Minimal registers (no acc_o/sink/lse) -> faster than the
+    full flash-attention _flash_attn_fwd_with_block_score_kernel. K is loaded
+    per-token via req_to_token (sglang's paged addressing), one BLOCK_SIZE_Q x
+    block_size QK tile per KV block, reduced with tl.max over the block. Only
+    score_type == "max".
+    """
+    sm_scale_log2e = sm_scale * 1.4426950409
+    pid_q, pid_bh = tl.program_id(0), tl.program_id(1)
+    pid_b = pid_bh // num_heads
+    pid_h = pid_bh % num_heads
+    pid_kh = pid_h // gqa_group_size
+    seq_start = tl.load(cu_seqlens + pid_b)
+    q_len = tl.load(cu_seqlens + pid_b + 1) - seq_start
+    seq_len = tl.load(seq_lens + pid_b)
+    prefix_len = tl.load(prefix_lens + pid_b)
+    if BLOCK_SIZE_Q * pid_q >= q_len:
+        return
+    sid = (tl.load(slot_ids + pid_b).to(tl.int64) + max_slots) % max_slots
+
+    q_ptrs = tl.make_block_ptr(
+        base=q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
+        shape=(q_len, qk_head_dim),
+        strides=(stride_q_n, stride_q_d),
+        offsets=(pid_q * BLOCK_SIZE_Q, 0),
+        block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_KD),
+        order=(1, 0),
+    )
+    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+
+    off_q = tl.arange(0, BLOCK_SIZE_Q) + pid_q * BLOCK_SIZE_Q + prefix_len
+    off_k = tl.arange(0, block_size)
+    off_kd = tl.arange(0, BLOCK_SIZE_KD)
+    kd_mask = off_kd < qk_head_dim
+    q_row = pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    q_store_mask = q_row < q_len
+
+    hi = min(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
+    for i in tl.range(0, hi, block_size):
+        blk = i // block_size
+        pos = i + off_k
+        pos_mask = pos < seq_len
+        slots = tl.load(
+            req_to_token_ptr + sid * stride_r2t_b + pos,
+            mask=pos_mask,
+            other=0,
+        ).to(tl.int64)
+        slots = (slots + max_slots) % max_slots
+        k = tl.load(
+            k_cache_ptr
+            + slots[None, :] * stride_k_s
+            + pid_kh * stride_k_h
+            + off_kd[:, None] * stride_k_d,
+            mask=kd_mask[:, None] & pos_mask[None, :],
+            other=0.0,
+        )
+        qk = tl.dot(q, k) * sm_scale_log2e
+        qk = tl.where(off_q[:, None] >= pos[None, :], qk, float("-inf"))
+        qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+        score = tl.max(qk, axis=1)  # [BLOCK_SIZE_Q]
+        s_ptrs = (
+            score_ptr
+            + pid_h * stride_s_h
+            + (seq_start + q_row) * stride_s_q
+            + blk * stride_s_k
+        )
+        tl.store(s_ptrs, score, mask=q_store_mask)
+
+
 @torch.no_grad()
 def flash_prefill_with_topk_index(
     q: torch.Tensor,
@@ -488,48 +603,79 @@ def flash_prefill_with_topk_index(
     def grid(META):
         return (triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"]), batch_size * num_heads)
 
-    _flash_attn_fwd_with_block_score_kernel[grid](
-        q,
-        k_cache,
-        v_cache,
-        sink,
-        o,
-        score,
-        req_to_token,
-        cu_seqlens,
-        seq_lens,
-        prefix_lens,
-        slot_ids,
-        max_slots,
-        num_heads,
-        gqa_group_size,
-        qk_head_dim,
-        v_head_dim,
-        block_size_k,
-        sm_scale,
-        False,
-        1,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        k_cache.stride(2),
-        v_cache.stride(0) if v_cache is not None else 0,
-        v_cache.stride(1) if v_cache is not None else 0,
-        v_cache.stride(2) if v_cache is not None else 0,
-        sink.stride(0) if sink is not None else 0,
-        sink.stride(1) if sink is not None else 0,
-        o.stride(0) if o is not None else 0,
-        o.stride(1) if o is not None else 0,
-        o.stride(2) if o is not None else 0,
-        score.stride(0),
-        score.stride(1),
-        score.stride(2),
-        req_to_token.stride(0),
-        SCORE_TYPE=score_type,
-        DISABLE_INDEX_VALUE=disable_index_value,
-    )
+    if disable_index_value and score_type == "max" and sink is None:
+        # Source layers don't use idx_o -> only the block scores are needed.
+        # Use the minimal score-only kernel (ATOM-style: no value/sink/lse
+        # attention), ~1.6x faster than the full flash-attention kernel.
+        _index_block_score_only_kernel[grid](
+            q,
+            k_cache,
+            score,
+            req_to_token,
+            cu_seqlens,
+            seq_lens,
+            prefix_lens,
+            slot_ids,
+            max_slots,
+            num_heads,
+            gqa_group_size,
+            qk_head_dim,
+            sm_scale,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            req_to_token.stride(0),
+            block_size=block_size_k,
+        )
+    else:
+        _flash_attn_fwd_with_block_score_kernel[grid](
+            q,
+            k_cache,
+            v_cache,
+            sink,
+            o,
+            score,
+            req_to_token,
+            cu_seqlens,
+            seq_lens,
+            prefix_lens,
+            slot_ids,
+            max_slots,
+            num_heads,
+            gqa_group_size,
+            qk_head_dim,
+            v_head_dim,
+            block_size_k,
+            sm_scale,
+            False,
+            1,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            v_cache.stride(0) if v_cache is not None else 0,
+            v_cache.stride(1) if v_cache is not None else 0,
+            v_cache.stride(2) if v_cache is not None else 0,
+            sink.stride(0) if sink is not None else 0,
+            sink.stride(1) if sink is not None else 0,
+            o.stride(0) if o is not None else 0,
+            o.stride(1) if o is not None else 0,
+            o.stride(2) if o is not None else 0,
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            req_to_token.stride(0),
+            SCORE_TYPE=score_type,
+            DISABLE_INDEX_VALUE=disable_index_value,
+        )
 
     # topk extraction kernel
     topk_idx = torch.full(
