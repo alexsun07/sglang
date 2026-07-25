@@ -524,6 +524,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             all_seqblock_q=all_seqblock_q,
             cached_topk_idx=cached_topk_idx,
             return_topk_idx=want_topk,
+            page_size=self.page_size,
         )
         if want_topk:
             idx_o, o, reduced_topk_idx = result

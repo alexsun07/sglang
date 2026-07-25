@@ -453,6 +453,7 @@ def _index_block_score_only_kernel(
     stride_r2t_b,
     BLOCK_SIZE_Q: tl.constexpr,
     block_size: tl.constexpr,  # sparse K block size (== 128)
+    page_size: tl.constexpr,  # paged-cache page size (== 64); block_size % page_size == 0
     BLOCK_SIZE_KD: tl.constexpr,
 ):
     """Score-only variant of the index attention (ATOM-style).
@@ -461,10 +462,18 @@ def _index_block_score_only_kernel(
     the block scores the top-k selection needs -- WITHOUT the index-value
     attention output (idx_o). Used for disable_index_value source layers, where
     idx_o is unused. Minimal registers (no acc_o/sink/lse) -> faster than the
-    full flash-attention _flash_attn_fwd_with_block_score_kernel. K is loaded
-    per-token via req_to_token (sglang's paged addressing), one BLOCK_SIZE_Q x
-    block_size QK tile per KV block, reduced with tl.max over the block. Only
-    score_type == "max".
+    full flash-attention _flash_attn_fwd_with_block_score_kernel.
+
+    K addressing is PER-PAGE (ATOM-style): a sparse block of ``block_size``
+    tokens spans ``block_size // page_size`` physical pages, and within a page
+    the paged allocator lays the ``page_size`` slots out contiguously and
+    ascending (slot = base_slot + offset). So instead of a per-token
+    req_to_token lookup for every token in the block (``block_size`` loads), we
+    read ONE base slot per page (``block_size // page_size`` loads) and derive
+    every token's slot as ``base_slot + in-page offset``. The resulting slot
+    vector is page-contiguous, so the single wide QK K-load coalesces. One
+    BLOCK_SIZE_Q x block_size QK tile per KV block, reduced with tl.max over the
+    block. Only score_type == "max".
     """
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_q, pid_bh = tl.program_id(0), tl.program_id(1)
@@ -492,32 +501,51 @@ def _index_block_score_only_kernel(
     off_q = tl.arange(0, BLOCK_SIZE_Q) + pid_q * BLOCK_SIZE_Q + prefix_len
     off_k = tl.arange(0, block_size)
     off_kd = tl.arange(0, BLOCK_SIZE_KD)
-    kd_mask = off_kd < qk_head_dim
     q_row = pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
     q_store_mask = q_row < q_len
+    pages_per_block: tl.constexpr = block_size // page_size
+    # Within a sparse block, each token's page index and in-page offset are fixed.
+    page_of = off_k // page_size  # [block_size] which physical page (0..pages-1)
+    in_page = off_k % page_size  # [block_size] offset inside that page
 
     hi = min(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
     for i in tl.range(0, hi, block_size):
         blk = i // block_size
         pos = i + off_k
         pos_mask = pos < seq_len
-        slots = tl.load(
-            req_to_token_ptr + sid * stride_r2t_b + pos,
-            mask=pos_mask,
-            other=0,
-        ).to(tl.int64)
-        slots = (slots + max_slots) % max_slots
+        # A sparse block spans `pages_per_block` physical pages. The paged
+        # allocator lays out each page's `page_size` slots contiguously
+        # (slot = base_slot + in-page offset), so ONE base-slot lookup per page
+        # (pages_per_block total) yields every token's slot -- replacing the
+        # per-token req_to_token gather (block_size lookups). We build the full
+        # [block_size] slot vector affinely, then do ONE wide QK dot over the
+        # whole block (a single 128-wide MFMA is far more efficient than
+        # per-page narrow dots).
+        slots = tl.zeros([block_size], dtype=tl.int64)
+        for p in tl.static_range(0, pages_per_block):
+            page_tok0 = i + p * page_size
+            base_slot = tl.load(
+                req_to_token_ptr + sid * stride_r2t_b + page_tok0,
+                mask=page_tok0 < seq_len,
+                other=0,
+            ).to(tl.int64)
+            base_slot = (base_slot + max_slots) % max_slots
+            slots = tl.where(page_of == p, base_slot + in_page, slots)
+        # head_dim (128) is a power of 2 == BLOCK_SIZE_KD, so the dim mask is
+        # always true -> only mask the K (token) dimension.
         k = tl.load(
             k_cache_ptr
             + slots[None, :] * stride_k_s
             + pid_kh * stride_k_h
             + off_kd[:, None] * stride_k_d,
-            mask=kd_mask[:, None] & pos_mask[None, :],
+            mask=pos_mask[None, :],
             other=0.0,
         )
         qk = tl.dot(q, k) * sm_scale_log2e
-        qk = tl.where(off_q[:, None] >= pos[None, :], qk, float("-inf"))
-        qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+        # single fused causal + K-boundary mask
+        qk = tl.where(
+            (off_q[:, None] >= pos[None, :]) & pos_mask[None, :], qk, float("-inf")
+        )
         score = tl.max(qk, axis=1)  # [BLOCK_SIZE_Q]
         s_ptrs = (
             score_ptr
@@ -553,11 +581,16 @@ def flash_prefill_with_topk_index(
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
+    page_size: int = 64,
 ):
     assert score_type in (
         "max",
         "lse",
     ), f"score_type must be 'max' or 'lse', got {score_type!r}"
+    assert block_size_k % page_size == 0, (
+        f"score-only kernel needs block_size_k ({block_size_k}) divisible by "
+        f"page_size ({page_size})"
+    )
     triton.set_allocator(robust_allocator)
     # dtype check
     assert q.dtype == torch.bfloat16 or q.dtype == torch.float16
@@ -632,6 +665,7 @@ def flash_prefill_with_topk_index(
             score.stride(2),
             req_to_token.stride(0),
             block_size=block_size_k,
+            page_size=page_size,
         )
     else:
         _flash_attn_fwd_with_block_score_kernel[grid](
