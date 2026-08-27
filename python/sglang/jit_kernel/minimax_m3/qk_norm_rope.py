@@ -681,7 +681,15 @@ def atom_main_norm_rope_cache(
     sglang keeps a single merged ``cos_sin_cache`` [max_pos, rotary_dim] (first
     half cos, second half sin); ATOM's kernel takes separate cos/sin pointers
     with a shared per-position row stride, so pass zero-copy column slices with
-    stride(0) == rotary_dim. bf16 KV cache only (IS_FP8=False).
+    stride(0) == rotary_dim.
+
+    IS_FP8 is left False even when ``k_cache``/``v_cache`` are fp8. That flag
+    selects the kernel's PER-TOKEN quantization branch, which writes a scale per
+    (page, head, slot); this stack stores the main KV UNIT-SCALED instead (see
+    minimax_sparse_ops/atom_prefill.py), and the non-IS_FP8 branch's
+    ``.to(cache_ptr.dtype.element_ty)`` against an fp8 buffer IS that unit-scale
+    cast. ``X_SIZE`` comes from ``k_cache.shape[4]``, so the 16-wide fp8 SHUFFLE
+    vectorization is picked up automatically.
     """
     assert q.dim() == k.dim() == v.dim() == 2
     assert k_cache.dim() == 5 and v_cache.dim() == 5

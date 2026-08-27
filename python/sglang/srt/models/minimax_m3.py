@@ -1111,7 +1111,6 @@ class MiniMaxM3Attention(nn.Module):
         ) in _FP8_KV_DTYPES
         can_fuse = (
             kv_pool is not None
-            and not main_kv_is_fp8
             and main_kv_layout == "vectorized_5d"
             and self._can_use_rocm_qk_norm_rope(positions, q, k)
             and getattr(forward_batch, "out_cache_loc", None) is not None
@@ -1159,13 +1158,18 @@ class MiniMaxM3Attention(nn.Module):
         fused_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         kv_pool = self._get_sparse_kv_pool()
-        # The fused qknorm+rope+kv-insert kernel writes the (normed/roped) bf16
-        # K and raw bf16 V straight into the paged cache buffer. When the main
-        # K/V cache is fp8 (--kv-cache-dtype fp8_*) that buffer is fp8, so the
-        # fusion cannot do the write. Fall back to the norm+rope-only path here
-        # and let the sparse backend's set_kv_buffer do the bf16->fp8 cache
-        # write (the index cache stays bf16, so its fusion is unaffected but is
-        # bundled in the same kernel, hence the whole fusion is skipped).
+        # The fused qknorm+rope+kv-insert kernels write the (normed/roped) K and
+        # raw V straight into the paged cache buffer, in plain NHD or SHUFFLE-5D.
+        #
+        # fp8 cache: the SKIP-layer kernel (_fused_qkv_norm_rope_cache, triton)
+        # stores with ``.to(cache_ptr.dtype)``, which against an fp8 buffer is
+        # exactly the unit-scale cast set_kv_buffer would have done -- so it can
+        # write fp8 directly. The SOURCE-layer kernel is aiter's C++ builtin,
+        # which takes its own kv_cache_dtype/scale arguments and is left on the
+        # fallback. Skip layers are 3/4 of the sparse stack at
+        # SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ=4, so this recovers most of the
+        # non-fused cost (the fp8 fallback cost +2.67 ms/forward across
+        # rope+cache and norm/quant).
         main_kv_is_fp8 = kv_pool is not None and kv_pool.dtype in _FP8_KV_DTYPES
         main_kv_layout = (
             getattr(getattr(kv_pool, "main_pool", None), "kv_cache_layout", None)
@@ -1177,8 +1181,7 @@ class MiniMaxM3Attention(nn.Module):
         # cache directly, eliminating the separate D2D cache-write copy before
         # sparse paged_attention. They require the vectorized_5d layout.
         can_use_cache_fusion = (
-            not main_kv_is_fp8
-            and main_kv_layout == "vectorized_5d"
+            main_kv_layout == "vectorized_5d"
             and idx_v is None
             and not forward_batch.forward_mode.is_decode_or_idle()
             and self._can_use_rocm_sparse_qk_index_norm_rope(
@@ -1229,6 +1232,11 @@ class MiniMaxM3Attention(nn.Module):
                     self.head_dim,
                     self.rotary_dim,
                 )
+            elif main_kv_is_fp8:
+                # Source layer on an fp8 cache: the aiter builtin owns its own
+                # fp8 handling (kv_cache_dtype + per-token scales, which this
+                # stack does not use), so leave it to set_kv_buffer.
+                return self._sparse_qk_index_norm_rope(positions, q, k, idx_q, idx_k)
             else:
                 q, idx_q = self._aiter_qknorm_idxr(
                     fused_out,
