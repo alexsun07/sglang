@@ -35,6 +35,21 @@ SPARSE_BLOCK_SIZE = 128
 # consumed zero-copy.
 GLUON_PAGE_SIZES = (16, 64)
 
+_FP8_KV_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2)
+
+# One 1.0 per device, allocated on first use and reused. This path also serves
+# decode under SGLANG_MINIMAX_M3_ATOM_DECODE, which runs inside a CUDA graph --
+# a fresh torch.ones() per call would allocate during replay.
+_UNIT_SCALE: dict = {}
+
+
+def _unit_scale(device: torch.device) -> torch.Tensor:
+    t = _UNIT_SCALE.get(device)
+    if t is None:
+        t = torch.ones(1, dtype=torch.float32, device=device)
+        _UNIT_SCALE[device] = t
+    return t
+
 
 @triton.jit
 def _build_atom_sparse_bt_prefill_kernel(
@@ -307,6 +322,20 @@ def atom_gluon_sparse_prefill(
         (*intermediate_shape, head_dim), dtype=q.dtype, device=q.device
     )
 
+    # fp8 main KV: read the cache as fp8 instead of misreading its bytes as
+    # bf16. The whole ref stack stores the main cache UNIT-SCALED (set_kv_buffer
+    # casts bf16->fp8 with no scale; the Triton sparse decode kernel widens with
+    # a bare cast and says so), so the descale is 1.0 -- passed as the [1]-shaped
+    # per-tensor scale pa_decode_gluon accepts. Measured against a bf16 cache of
+    # the same values at the M3 prefill shape (8192 rows x 2048 ctx): 1.94x, and
+    # cos 0.998578 -- identical to what per-token scales give, because e4m3 is a
+    # float format and a scale only matters when values would over/underflow.
+    compute_type = q.dtype
+    key_scale = value_scale = None
+    if k_cache.dtype in _FP8_KV_DTYPES:
+        compute_type = k_cache.dtype
+        key_scale = value_scale = _unit_scale(q.device)
+
     pa_decode_gluon(
         output=out,
         query=q,
@@ -318,9 +347,9 @@ def atom_gluon_sparse_prefill(
         query_length=1,
         max_context_partition_num=max_part_num,
         context_partition_size=ctx_part,
-        compute_type=q.dtype,
-        key_scale=None,
-        value_scale=None,
+        compute_type=compute_type,
+        key_scale=key_scale,
+        value_scale=value_scale,
         exp_sums=exp_sums,
         max_logits=max_logits,
         temporary_output=temporary_output,
