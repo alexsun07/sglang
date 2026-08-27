@@ -418,16 +418,18 @@ def _topk_index_kernel(
 )
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_SIZE_Q": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_SIZE_Q": 64}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_SIZE_Q": 64}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_SIZE_Q": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_Q": 128}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE_Q": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE_Q": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_SIZE_Q": 128}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_SIZE_Q": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE_Q": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_SIZE_Q": 64}, num_warps=4, num_stages=2),
     ],
     key=["qk_head_dim", "block_size"],
 )
 @triton.jit
-def _index_block_score_only_kernel(
+def _index_block_score_fast_kernel(
     q_ptr,  # Q: [total_q, h, d]
     k_cache_ptr,  # K paged: [max_slots, kh, d]
     score_ptr,  # Score: [h, total_q, max_seqblock]
@@ -436,7 +438,6 @@ def _index_block_score_only_kernel(
     seq_lens,
     prefix_lens,
     slot_ids,
-    max_slots,
     num_heads,
     gqa_group_size,
     qk_head_dim,
@@ -456,24 +457,39 @@ def _index_block_score_only_kernel(
     page_size: tl.constexpr,  # paged-cache page size (== 64); block_size % page_size == 0
     BLOCK_SIZE_KD: tl.constexpr,
 ):
-    """Score-only variant of the index attention (ATOM-style).
+    """Score-only index attention, ATOM-structured (ATOM #1473
+    ``_index_block_score_kernel``) but on sglang's flat paged index-K cache.
 
     Computes, per (query token, KV block), the causal max of idx_q . index_k --
     the block scores the top-k selection needs -- WITHOUT the index-value
     attention output (idx_o). Used for disable_index_value source layers, where
-    idx_o is unused. Minimal registers (no acc_o/sink/lse) -> faster than the
-    full flash-attention _flash_attn_fwd_with_block_score_kernel.
+    idx_o is unused. Only score_type == "max".
 
-    K addressing is PER-PAGE (ATOM-style): a sparse block of ``block_size``
-    tokens spans ``block_size // page_size`` physical pages, and within a page
-    the paged allocator lays the ``page_size`` slots out contiguously and
-    ascending (slot = base_slot + offset). So instead of a per-token
-    req_to_token lookup for every token in the block (``block_size`` loads), we
-    read ONE base slot per page (``block_size // page_size`` loads) and derive
-    every token's slot as ``base_slot + in-page offset``. The resulting slot
-    vector is page-contiguous, so the single wide QK K-load coalesces. One
-    BLOCK_SIZE_Q x block_size QK tile per KV block, reduced with tl.max over the
-    block. Only score_type == "max".
+    K addressing is PER-PAGE: a sparse block of ``block_size`` tokens spans
+    ``block_size // page_size`` physical pages, and within a page the paged
+    allocator lays the ``page_size`` slots out contiguously and ascending
+    (slot = base_slot + offset). So ONE base-slot lookup per page replaces the
+    per-token req_to_token gather, and one wide BLOCK_SIZE_Q x block_size QK
+    tile is issued per KV block.
+
+    The inner loop follows ATOM's discipline, which is what makes it ~1.6x
+    faster than the straightforward version (measured; none of it needs ATOM's
+    block-128 contiguous index-K layout -- that layout is worth only ~7%):
+
+    * **No int64 modulo in the loop.** The negative-slot guard is a clamp
+      (``maximum(x, 0)``), not ``(x + max_slots) % max_slots``: an int64
+      remainder by a non-power-of-2 is a multi-instruction sequence emitted
+      ``pages_per_block`` times per KV block, and it was the single largest cost
+      (~17% of the kernel).
+    * **Causal mask only on the diagonal tile** (``if q_start < i + block_size``)
+      instead of an unconditional ``tl.where`` on every tile. Fully-past tiles
+      need no mask at all.
+    * **No mask on the K load.** Pages are allocated whole, so reading the
+      padding tail of the final page is in-bounds; those positions sit beyond
+      every query token and the causal mask on the diagonal tile drops them.
+    * **BLOCK_SIZE_Q=128 with num_warps=4** is the best config at the M3 index
+      shape and was absent from the old autotune list (which only paired 128
+      with 8 warps).
     """
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_q, pid_bh = tl.program_id(0), tl.program_id(1)
@@ -486,7 +502,7 @@ def _index_block_score_only_kernel(
     prefix_len = tl.load(prefix_lens + pid_b)
     if BLOCK_SIZE_Q * pid_q >= q_len:
         return
-    sid = (tl.load(slot_ids + pid_b).to(tl.int64) + max_slots) % max_slots
+    sid = tl.maximum(tl.load(slot_ids + pid_b), 0).to(tl.int64)
 
     q_ptrs = tl.make_block_ptr(
         base=q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
@@ -496,56 +512,43 @@ def _index_block_score_only_kernel(
         block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_KD),
         order=(1, 0),
     )
-    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    q = tl.load(q_ptrs, boundary_check=(0,), padding_option="zero")
 
     off_q = tl.arange(0, BLOCK_SIZE_Q) + pid_q * BLOCK_SIZE_Q + prefix_len
     off_k = tl.arange(0, block_size)
     off_kd = tl.arange(0, BLOCK_SIZE_KD)
     q_row = pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
     q_store_mask = q_row < q_len
+    q_start = prefix_len + pid_q * BLOCK_SIZE_Q
     pages_per_block: tl.constexpr = block_size // page_size
     # Within a sparse block, each token's page index and in-page offset are fixed.
     page_of = off_k // page_size  # [block_size] which physical page (0..pages-1)
     in_page = off_k % page_size  # [block_size] offset inside that page
+    # Hoisted: the req_to_token row base is loop-invariant.
+    r2t_row = req_to_token_ptr + sid * stride_r2t_b
+    k_head_base = k_cache_ptr + pid_kh * stride_k_h + off_kd[:, None] * stride_k_d
 
     hi = min(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
     for i in tl.range(0, hi, block_size):
         blk = i // block_size
-        pos = i + off_k
-        pos_mask = pos < seq_len
-        # A sparse block spans `pages_per_block` physical pages. The paged
-        # allocator lays out each page's `page_size` slots contiguously
-        # (slot = base_slot + in-page offset), so ONE base-slot lookup per page
-        # (pages_per_block total) yields every token's slot -- replacing the
-        # per-token req_to_token gather (block_size lookups). We build the full
-        # [block_size] slot vector affinely, then do ONE wide QK dot over the
-        # whole block (a single 128-wide MFMA is far more efficient than
-        # per-page narrow dots).
         slots = tl.zeros([block_size], dtype=tl.int64)
         for p in tl.static_range(0, pages_per_block):
             page_tok0 = i + p * page_size
+            # Masked so a page start past seq_len reads slot 0 (in-bounds) --
+            # those positions are masked out of qk below.
             base_slot = tl.load(
-                req_to_token_ptr + sid * stride_r2t_b + page_tok0,
-                mask=page_tok0 < seq_len,
-                other=0,
-            ).to(tl.int64)
-            base_slot = (base_slot + max_slots) % max_slots
+                r2t_row + page_tok0, mask=page_tok0 < seq_len, other=0
+            )
+            base_slot = tl.maximum(base_slot, 0).to(tl.int64)
             slots = tl.where(page_of == p, base_slot + in_page, slots)
-        # head_dim (128) is a power of 2 == BLOCK_SIZE_KD, so the dim mask is
-        # always true -> only mask the K (token) dimension.
-        k = tl.load(
-            k_cache_ptr
-            + slots[None, :] * stride_k_s
-            + pid_kh * stride_k_h
-            + off_kd[:, None] * stride_k_d,
-            mask=pos_mask[None, :],
-            other=0.0,
-        )
+        # Unmasked: pages are allocated whole, so every slot here is in-bounds.
+        k = tl.load(k_head_base + slots[None, :] * stride_k_s)
         qk = tl.dot(q, k) * sm_scale_log2e
-        # single fused causal + K-boundary mask
-        qk = tl.where(
-            (off_q[:, None] >= pos[None, :]) & pos_mask[None, :], qk, float("-inf")
-        )
+        # Only the diagonal tile can straddle the causal boundary; it is also
+        # the only tile that can run past seq_len into the page tail, and those
+        # positions are >= every query position so the same mask drops them.
+        if q_start < i + block_size:
+            qk = tl.where(off_q[:, None] >= (i + off_k)[None, :], qk, float("-inf"))
         score = tl.max(qk, axis=1)  # [BLOCK_SIZE_Q]
         s_ptrs = (
             score_ptr
@@ -625,22 +628,44 @@ def flash_prefill_with_topk_index(
         o = None
     else:
         o = torch.empty(total_q, num_heads, v_head_dim, dtype=q.dtype, device=q.device)
-    score = torch.full(
-        (num_heads, total_q, max_seqblock_k),
-        float("-inf"),
-        dtype=torch.float32,
-        device=q.device,
-    )
+    score_only = disable_index_value and score_type == "max" and sink is None
+    if score_only:
+        # The score-only kernel writes every block the top-k pass can read
+        # (its causal window is a superset of each token's valid_blocks), and
+        # the top-k kernel masks past valid_blocks -- so the -inf prefill is
+        # dead work on a buffer that is hundreds of MB at the M3 prefill shape.
+        import os as _os
+        if _os.environ.get("SGLANG_M3_POISON_SCORE") == "1":
+            # POISON (debug): any block the kernel fails to write becomes NaN.
+            score = torch.full(
+                (num_heads, total_q, max_seqblock_k),
+                float("nan"),
+                dtype=torch.float32,
+                device=q.device,
+            )
+        else:
+            score = torch.empty(
+                (num_heads, total_q, max_seqblock_k),
+                dtype=torch.float32,
+                device=q.device,
+            )
+    else:
+        score = torch.full(
+            (num_heads, total_q, max_seqblock_k),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
 
     # launch kernel
     def grid(META):
         return (triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"]), batch_size * num_heads)
 
-    if disable_index_value and score_type == "max" and sink is None:
+    if score_only:
         # Source layers don't use idx_o -> only the block scores are needed.
         # Use the minimal score-only kernel (ATOM-style: no value/sink/lse
         # attention), ~1.6x faster than the full flash-attention kernel.
-        _index_block_score_only_kernel[grid](
+        _index_block_score_fast_kernel[grid](
             q,
             k_cache,
             score,
@@ -649,7 +674,6 @@ def flash_prefill_with_topk_index(
             seq_lens,
             prefix_lens,
             slot_ids,
-            max_slots,
             num_heads,
             gqa_group_size,
             qk_head_dim,
