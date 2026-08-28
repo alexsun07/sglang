@@ -328,8 +328,29 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
 
         merge_vit_qkv_weights(vit_qkv_weights, vit_qkv_biases, params_dict)
 
-        # Fuse main qkv_proj + sparse index_qkv_proj into one GEMM per sparse
-        # attention layer (see MiniMaxM3.load_weights for the rationale).
+        # DefaultModelLoader does NOT call _post_load_weights; the convention is
+        # that load_weights invokes it itself, and the loaders that bypass
+        # load_weights call it directly.
+        self.post_load_weights()
+
+    def post_load_weights(self) -> None:
+        """Fuse main qkv_proj + sparse index_qkv_proj into one GEMM per sparse layer.
+
+        Must live here rather than only at the end of ``load_weights``: the
+        dummy / sharded-state / remote loaders never call ``load_weights`` --
+        they populate the parameters directly and then call this hook
+        (loader.py ``_post_load_weights``). This class is the ``EntryClass``, so
+        it is the object the loader sees; putting the hook only on the inner
+        ``MiniMaxM3SparseForCausalLM`` does nothing, because ``hasattr(model,
+        "post_load_weights")`` is checked on the wrapper.
+
+        Without this, ``--load-format dummy`` silently ran a DIFFERENT model:
+        two projections per sparse layer instead of one (an extra N=256 GEMM
+        x57), and ``fused_out is None``, which disabled the fused rope+cache
+        write on all 57 sparse layers. dummy is documented as the path "for
+        accurate performance evaluation", so it must not change which kernels
+        run -- any A/B measured under dummy was comparing the wrong thing.
+        """
         build_minimax_fused_qkv_index(self)
 
     def _load_llm_weight(

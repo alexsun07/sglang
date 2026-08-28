@@ -2111,12 +2111,31 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
 
-        # Fuse main qkv_proj + sparse index_qkv_proj into one GEMM. The raw fp8
-        # weight + uint8 scale are final at this point (the mxfp8 post-process
-        # only derives the packed scale), so this runs deterministically before
-        # the loader's process pass and CUDA graph capture.
-        build_minimax_fused_qkv_index(self)
+        # DefaultModelLoader does NOT call _post_load_weights; the convention
+        # (deepseek_ocr, longcat_flash_nextn, ...) is that load_weights invokes
+        # it itself, and the loaders that bypass load_weights call it directly.
+        self.post_load_weights()
         return loaded_params
+
+    def post_load_weights(self) -> None:
+        """Fuse main qkv_proj + sparse index_qkv_proj into one GEMM.
+
+        This lives here, not at the end of ``load_weights``, because the dummy /
+        sharded-state / remote loaders never call ``load_weights`` -- they fill
+        the parameters directly and then call this hook (loader.py
+        ``_post_load_weights``). Building the fusion only in ``load_weights``
+        made ``--load-format dummy`` silently run a DIFFERENT model: two
+        projections instead of one (an extra N=256 GEMM per sparse layer), and
+        ``fused_out is None``, which in turn disabled the fused rope+cache write
+        on all 57 sparse layers. dummy is documented as the path "for accurate
+        performance evaluation", so it must not change which kernels run.
+
+        Timing is unchanged: every caller of this hook runs it after the weights
+        are populated and before the loader's ``process_weights_after_loading``
+        pass, which is what the fusion needs (it reads the raw fp8 weight + uint8
+        scale; the mxfp8 post-process only derives the packed scale afterwards).
+        """
+        build_minimax_fused_qkv_index(self)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
