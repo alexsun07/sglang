@@ -114,6 +114,7 @@ def _fused_rmsnorm_fp8_per_token_quant(
     weight: torch.Tensor,
     epsilon: float,
     residual: Optional[torch.Tensor] = None,
+    gemma_norm: bool = False,
 ):
     """Fused (optional residual-add +) RMSNorm + FP8 per-token quantization.
 
@@ -122,6 +123,12 @@ def _fused_rmsnorm_fp8_per_token_quant(
     Args:
         residual: if provided, computes hidden_states + residual before RMSNorm
                   and returns updated residual_out as second element.
+        gemma_norm: Gemma-style norm -- ``x * (1 + w)`` with the multiply applied
+                  before the cast back, as opposed to plain ``x * w``. This is
+                  NOT a cosmetic difference: leaving it False on a Gemma-norm
+                  model (MiniMax-M3, Gemma) silently computes a different
+                  function -- measured mean relative error 1.0 against the
+                  reference, i.e. the output is unrelated.
 
     Returns:
         If residual is None:  (out_fp8, scale)
@@ -141,6 +148,8 @@ def _fused_rmsnorm_fp8_per_token_quant(
             weight,
             epsilon,
             0,  # group_size=0 → per-token
+            False,  # shuffle_scale
+            gemma_norm,
         )
         return (out_fp8, scale.unsqueeze(1)), residual_out
     else:
@@ -151,6 +160,8 @@ def _fused_rmsnorm_fp8_per_token_quant(
             weight,
             epsilon,
             0,  # group_size=0 → per-token
+            False,  # shuffle_scale
+            gemma_norm,
         )
         return (out_fp8, scale.unsqueeze(1))
 
@@ -452,6 +463,14 @@ class LayerCommunicator:
         self.qkv_latent_func = qkv_latent_func
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
 
+        # The fused aiter norm+quant kernel takes the norm flavour as a flag, so
+        # it has to be told which one this layer uses. Derived from the module
+        # rather than passed in, so a caller cannot enable quant_format on a
+        # Gemma-norm model and silently get plain-RMSNorm math.
+        from sglang.srt.layers.layernorm import GemmaRMSNorm
+
+        self._input_layernorm_gemma = isinstance(input_layernorm, GemmaRMSNorm)
+
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
             force_layernorm_before_dp_gather
@@ -620,6 +639,7 @@ class LayerCommunicator:
                             hidden_states,
                             self.input_layernorm.weight.data,
                             self.input_layernorm.variance_epsilon,
+                            gemma_norm=self._input_layernorm_gemma,
                         )
 
                     else:
@@ -669,6 +689,7 @@ class LayerCommunicator:
                             self.input_layernorm.weight.data,
                             self.input_layernorm.variance_epsilon,
                             residual=residual,
+                            gemma_norm=self._input_layernorm_gemma,
                         )
                     else:
                         hidden_states, residual = self.input_layernorm(

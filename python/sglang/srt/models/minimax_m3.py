@@ -1666,6 +1666,38 @@ class MiniMaxM3DecoderLayer(nn.Module):
             allow_reduce_scatter=True,
         )
 
+        # Resolved on the first forward (see _resolve_attn_quant_format): the
+        # ptpc conversion happens in process_weights_after_loading, which runs
+        # after this __init__ *and* after load_weights' post_load_weights hook.
+        self._attn_quant_format: Optional[str] = None
+
+    def _resolve_attn_quant_format(self) -> str:
+        """"fp8_per_token" when the qkv projection(s) consume pre-quantized fp8.
+
+        With SGLANG_M3_PTPC_DENSE the attention linears run ATOM's ptpc_fp8
+        recipe, whose apply() already accepts an (fp8, scale) tuple. Saying so
+        here lets prepare_attn fuse the residual add, the Gemma RMSNorm and the
+        per-token quant into one aiter kernel instead of running the triton norm
+        and then quantizing in a second kernel. Measured on MI355X
+        (tests/bench_gemma_norm.py, M=32602, N=6144):
+
+            triton norm + separate quant   11.78 us / 1k tok
+            aiter add_rmsnorm_quant         6.34 us / 1k tok    1.86x
+
+        Both qkv projections must be on that path -- with the concat GEMM
+        disabled (the ROCm default) the index projection is a separate linear
+        and would otherwise be handed a tuple it cannot use.
+        """
+        attn = self.self_attn
+        projs = [getattr(attn, "fused_qkv_index_proj", None) or attn.qkv_proj]
+        if getattr(attn, "is_sparse_attention_layer", False) and getattr(
+            attn, "_fused_qkv_index", None
+        ) is None:
+            projs.append(attn.index_qkv_proj)
+        if all(getattr(p, "_m3_ptpc", False) for p in projs):
+            return "fp8_per_token"
+        return ""
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1676,17 +1708,27 @@ class MiniMaxM3DecoderLayer(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         # Self Attention
+        if self._attn_quant_format is None:
+            self._attn_quant_format = self._resolve_attn_quant_format()
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
                 residual,
                 forward_batch,
                 captured_last_layer_outputs=captured_last_layer_outputs,
+                quant_format=self._attn_quant_format,
                 **kwargs,
             )
         )
 
-        if hidden_states.shape[0] != 0:
+        # hidden_states is an (fp8, scale) tuple under "fp8_per_token"; both
+        # entries share the token dim, so read it off the fp8 tensor.
+        num_tokens = (
+            hidden_states[0].shape[0]
+            if isinstance(hidden_states, tuple)
+            else hidden_states.shape[0]
+        )
+        if num_tokens != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
