@@ -109,6 +109,25 @@ _device_sm = get_device_sm()
 # shared-expert column (see topk.py SGLANG_M3_SHARED_FUSION).
 _m3_shared_fusion = get_bool_env_var("SGLANG_M3_SHARED_FUSION")
 
+# Concat the main qkv_proj (N=2304 at TP4) and the sparse index_qkv_proj (N=256)
+# into one N=2560 GEMM. Saves a kernel launch and one read of the hidden state,
+# but the concatenated N is a shape nobody tuned: on ROCm with the ptpc_fp8
+# recipe (SGLANG_M3_PTPC_DENSE, ATOM's) aiter has a tuned
+# a8w8_bpreshuffle entry for N=2304 that selects the ck_tile Flatmm kernel,
+# while N=2560 falls back to the older ck::kernel_gemm_xdl_cshuffle_v3 path.
+# Measured on MI355X, M=32602, K=6144 (tests/bench_qkv_gemm.py), same process:
+#
+#     fused   N=2560           1.313 ms   ck_gemm_xdl_cshuffle_v3
+#     split   N=2304 + N=256   0.588 ms   ck_tile Flatmm  (+ a tiny XDL for 256)
+#
+# 2.2x, identical FLOPs, x57 sparse layers = ~41 ms per 32k-token prefill
+# forward. So default the fusion OFF on HIP and keep it on CUDA, where the
+# fused buffer additionally feeds the combined qknorm+rope launch
+# (_combined_qknorm_ok, CUDA-only). Override either way with the env var.
+_m3_fuse_qkv_index_gemm = get_bool_env_var(
+    "SGLANG_M3_FUSE_QKV_INDEX_GEMM", "false" if _is_hip else "true"
+)
+
 # fp8 main-K/V cache dtypes (index cache always stays bf16). When the sparse
 # pool is one of these, the bf16-only qknorm+rope+kv-insert fusion is skipped so
 # the backend's set_kv_buffer performs the bf16->fp8 cache write instead.
@@ -754,8 +773,10 @@ class MiniMaxM3Attention(nn.Module):
         # maybe_build_fused_qkv_index(); falls back to two GEMMs when the quant
         # method does not support a safe output-dim concat (only unquantized
         # bf16 and mxfp8 are fused; anything else keeps the two projections).
-        self._fuse_qkv_index_enabled = self.is_sparse_attention_layer and (
-            _is_cuda or _is_hip
+        self._fuse_qkv_index_enabled = (
+            self.is_sparse_attention_layer
+            and (_is_cuda or _is_hip)
+            and _m3_fuse_qkv_index_gemm
         )
         self._fused_qkv_index = None
         # Per-token main width (q | k | v), in elements; index columns follow it
@@ -1192,11 +1213,14 @@ class MiniMaxM3Attention(nn.Module):
             and v.dtype == q.dtype
             and v.shape == k.shape
         )
-        # The aiter/ATOM fused rope+cache path needs the packed [q|k|v|idx_q|idx_k]
-        # GEMM output (fused_out) for the aiter builtin and the 5D SHUFFLE cache.
-        # When the fused qkv+index GEMM is disabled (two separate GEMMs -> no
-        # packed tensor) fall back to the non-fused norm+rope path.
-        if can_use_cache_fusion and kv_pool is not None and fused_out is not None:
+        # Only the SOURCE-layer kernel (aiter's fused_qknorm_idxrqknorm builtin)
+        # consumes the packed [q|k|v|idx_q|idx_k] GEMM output; the SKIP-layer
+        # kernel takes q/k/v as separate tensors and does not care where they
+        # came from. Requiring fused_out up here therefore threw away the fused
+        # rope+cache write on every layer whenever the qkv+index GEMM fusion was
+        # off -- which is now the default on ROCm (see _m3_fuse_qkv_index_gemm),
+        # and which is also what ATOM does: two GEMMs, fused rope+cache.
+        if can_use_cache_fusion and kv_pool is not None:
             layer_id = self.attn.layer_id
             k_cache, v_cache = kv_pool.get_kv_buffer(layer_id)
             idx_k_cache = kv_pool.get_index_k_buffer(layer_id)
@@ -1232,10 +1256,13 @@ class MiniMaxM3Attention(nn.Module):
                     self.head_dim,
                     self.rotary_dim,
                 )
-            elif main_kv_is_fp8:
-                # Source layer on an fp8 cache: the aiter builtin owns its own
-                # fp8 handling (kv_cache_dtype + per-token scales, which this
-                # stack does not use), so leave it to set_kv_buffer.
+            elif main_kv_is_fp8 or fused_out is None:
+                # Source layer that cannot use the aiter builtin:
+                #   * fp8 cache -- the builtin owns its own fp8 handling
+                #     (kv_cache_dtype + per-token scales, which this stack does
+                #     not use), so leave the write to set_kv_buffer;
+                #   * no packed GEMM output -- the builtin reads q|k|v|idx_q|idx_k
+                #     as one contiguous row, which only the fused GEMM produces.
                 return self._sparse_qk_index_norm_rope(positions, q, k, idx_q, idx_k)
             else:
                 q, idx_q = self._aiter_qknorm_idxr(
