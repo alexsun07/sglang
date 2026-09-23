@@ -31,6 +31,21 @@ SPARSE_BLOCK_SIZE = 128
 # width and page count vs 16 (the source ran page 64: 2 pages per sparse block).
 GLUON_PAGE_SIZE = 64
 PAGES_PER_BLOCK = SPARSE_BLOCK_SIZE // GLUON_PAGE_SIZE
+
+# _GLUON_FP8_KV_PATCH
+_FP8_KV_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2)
+
+# One 1.0 per device, allocated on first use and reused: a fresh torch.ones()
+# per call would allocate inside a CUDA graph replay.
+_UNIT_SCALE: dict = {}
+
+
+def _unit_scale(device: torch.device) -> torch.Tensor:
+    t = _UNIT_SCALE.get(device)
+    if t is None:
+        t = torch.ones(1, dtype=torch.float32, device=device)
+        _UNIT_SCALE[device] = t
+    return t
 HEAD_DIM = 128
 # Scratch grows in 1024-page steps (16 KiB/page/buffer -> 16 MiB granularity).
 _SCRATCH_GROW_PAGES = 1024
@@ -393,8 +408,10 @@ def can_use_gluon_prefill(
         and k_cache.shape[2] == HEAD_DIM
         and v_cache.shape[2] == HEAD_DIM
         and q.dtype in (torch.bfloat16, torch.float16)
-        and k_cache.dtype == q.dtype
-        and v_cache.dtype == q.dtype
+        # _GLUON_FP8_KV_PATCH: an fp8 main pool is fine -- the kernel reads it
+        # as fp8 given compute_type + unit scales at the call site.
+        and k_cache.dtype == v_cache.dtype
+        and (k_cache.dtype == q.dtype or k_cache.dtype in _FP8_KV_DTYPES)
         and k_cache.stride(2) == 1
         and v_cache.stride(2) == 1
         and _unit_or_none(q_scale)
@@ -482,6 +499,15 @@ def gluon_sparse_prefill(
         (*intermediate_shape, head_dim), dtype=q.dtype, device=q.device
     )
 
+    # _GLUON_FP8_KV_PATCH: with an fp8 pool, tell the kernel so instead of
+    # letting it reinterpret the fp8 bytes as bf16. The cache is unit-scaled
+    # throughout this stack, so the descale is a [1]-shaped 1.0.
+    compute_type = q.dtype
+    key_scale = value_scale = None
+    if k_cache.dtype in _FP8_KV_DTYPES:
+        compute_type = k_cache.dtype
+        key_scale = value_scale = _unit_scale(q.device)
+
     pa_decode_gluon(
         output=out,
         query=q,
@@ -493,9 +519,9 @@ def gluon_sparse_prefill(
         query_length=1,
         max_context_partition_num=max_part_num,
         context_partition_size=ctx_part,
-        compute_type=q.dtype,
-        key_scale=None,
-        value_scale=None,
+        compute_type=compute_type,
+        key_scale=key_scale,
+        value_scale=value_scale,
         exp_sums=exp_sums,
         max_logits=max_logits,
         temporary_output=temporary_output,
