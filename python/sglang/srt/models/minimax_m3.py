@@ -234,6 +234,15 @@ class _FusedQKVIndexProj(nn.Module):
             else:
                 # Derive the backend scale layout for the native MXFP8 GEMM.
                 quant_method._process_mxfp8_linear_weight_scale(self)
+                # _M3_PTPC_FUSED_QKV_PATCH: this module is deliberately skipped
+                # by the loader's post-process loop (see ``_qm``), so the ptpc
+                # conversion that hangs off process_weights_after_loading never
+                # reaches it. Apply it here for the same reason the scale layout
+                # is derived here.
+                from sglang.srt.layers.quantization.fp8 import _m3_ptpc_dense
+
+                if _m3_ptpc_dense:
+                    quant_method._convert_mxfp8_linear_to_ptpc(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._qm.apply(self, x, None)
