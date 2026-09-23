@@ -234,11 +234,16 @@ def _build_mixed_precision_layer_quant_config(
             has_nvfp4 = True
         elif algo == "FP8":
             layer_quant_config[pattern] = fp8_spec
+        elif algo == "MXFP8":
+            # _MXFP8_MIXED_PATCH: handled out of band -- these layers do not go
+            # through a quark scheme at all, they load via Fp8LinearMethod with
+            # Fp8Config(use_mxfp8=True). See QuarkConfig.mxfp8_layers.
+            continue
         else:
             raise NotImplementedError(
                 f"MIXED_PRECISION layer group {tail!r} uses unsupported "
                 f"quant algo {algo!r}; online requantization supports NVFP4 "
-                "(-> MXFP4) and FP8 (kept as-is) only."
+                "(-> MXFP4), MXFP8 and FP8 (kept as-is) only."
             )
     return layer_quant_config, has_nvfp4
 
@@ -298,6 +303,8 @@ class QuarkConfig(QuantizationConfig):
         online_scheme: Optional[str] = None,
         dequantization_config: Optional[QuantizationConfig] = None,
         excluded_fp8_config: Optional[Fp8Config] = None,
+        mxfp8_layers: Optional[list[str]] = None,
+        mxfp8_config: Optional[Fp8Config] = None,
     ):
         super().__init__()
         if kv_cache_group is None:
@@ -337,6 +344,11 @@ class QuarkConfig(QuantizationConfig):
         # which describes the requantization *source*. `weight_block_size`
         # selects block vs per-tensor FP8 within `Fp8LinearMethod`.
         self.excluded_fp8_config = excluded_fp8_config
+        # _MXFP8_MIXED_PATCH: MXFP8 layers of a MIXED_PRECISION source. Kept
+        # separate from exclude_layers -- for a ModelOpt mixed source the
+        # excludes are bf16, so they must NOT pick up an fp8 config.
+        self.mxfp8_layers = list(mxfp8_layers or [])
+        self.mxfp8_config = mxfp8_config
         self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
         self._online_quantized_layers = set()
 
@@ -374,6 +386,17 @@ class QuarkConfig(QuantizationConfig):
             if name.startswith("language_model."):
                 expanded.append(name.removeprefix("language_model."))
         self.exclude_layers = list(dict.fromkeys(expanded))
+        # _MXFP8_MIXED_PATCH: same normalization for the MXFP8 list, otherwise
+        # the names coming from quantized_layers keep a "language_model."
+        # prefix the runtime module paths do not have.
+        if self.mxfp8_layers:
+            mapped_mx = hf_to_sglang_mapper.apply_list(self.mxfp8_layers)
+            expanded_mx = []
+            for name in mapped_mx:
+                expanded_mx.append(name)
+                if name.startswith("language_model."):
+                    expanded_mx.append(name.removeprefix("language_model."))
+            self.mxfp8_layers = list(dict.fromkeys(expanded_mx))
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -395,6 +418,21 @@ class QuarkConfig(QuantizationConfig):
             elif isinstance(layer, RadixAttention):
                 return QuarkKVCacheMethod(self)
             return None
+
+        # _MXFP8_MIXED_PATCH: MXFP8 layers load as-is, before any quark scheme
+        # lookup. should_ignore_layer (not fnmatch) so fused gate_up_proj /
+        # qkv_proj resolve through packed_modules_mapping.
+        if (
+            isinstance(layer, LinearBase)
+            and self.mxfp8_config is not None
+            and self.mxfp8_layers
+            and should_ignore_layer(
+                prefix,
+                ignore=self.mxfp8_layers,
+                fused_mapping=self.packed_modules_mapping,
+            )
+        ):
+            return Fp8LinearMethod(quant_config=self.mxfp8_config)
 
         if isinstance(layer, LinearBase):
             scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
@@ -451,12 +489,34 @@ class QuarkConfig(QuantizationConfig):
                 # NVFP4/ModelOpt-mixed sources keep excluded layers in bf16, and
                 # their FP8 layers (if any) are enumerated in the layer map.
                 excluded_fp8_config = _build_excluded_fp8_config(config)
+                # _MXFP8_MIXED_PATCH: MXFP8 groups load as-is through
+                # Fp8LinearMethod. Fp8Config.from_config keys use_mxfp8 off the
+                # quant_method string and pins weight_block_size to [1, 32].
+                mxfp8_layers = [
+                    name
+                    for name, algo in layer_map.items()
+                    if algo == "MXFP8"
+                ]
+                mxfp8_config = None
+                if mxfp8_layers:
+                    mxfp8_config = Fp8Config.from_config(
+                        {
+                            "quant_method": "mxfp8",
+                            "activation_scheme": "dynamic",
+                            "packed_modules_mapping": config.get(
+                                "packed_modules_mapping"
+                            )
+                            or {},
+                        }
+                    )
                 return cls(
                     quant_config=quant_config,
                     hf_config=hf_config,
                     is_prequantized=False,
                     dequantization_config=Nvfp4SourceConfig(),
                     excluded_fp8_config=excluded_fp8_config,
+                    mxfp8_layers=mxfp8_layers,
+                    mxfp8_config=mxfp8_config,
                 )
 
             nvfp4_src = _detect_nvfp4_source(config)
